@@ -1,0 +1,5 @@
+{
+  "name": "Aurora",
+  "install": "[ ! -d '/agent/repos/AuroraV1' ] || cd '/agent/repos/AuroraV1' || exit $?\nnpm ci",
+  "start": "[ ! -d '/agent/repos/AuroraV1' ] || cd '/agent/repos/AuroraV1' || exit $?\nexec npm run dev -- --host 0.0.0.0 --port 5173"
+}
