@@ -29,7 +29,18 @@ from botocore.exceptions import ClientError
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
+from markdown_repair import reparar_markdown
 from manual_context import select_manual_context, flatten_to_text
+from audience_adaptation import (
+    content_audience_block,
+    promover_teoria_a_demo,
+    ratio_teoria_demo,
+    resolve_audience_profile,
+    scale_theory_target_words,
+)
+from bedrock_fallback import fallback_model_ids, run_model_chain
+
+MARCA_PLACEHOLDER_LECCION = "AURORA_PLACEHOLDER_PENDING_REGENERATION"
 
 # Configure boto3 with extended timeouts for long-running LLM calls
 boto_config = Config(
@@ -373,7 +384,12 @@ def generate_batch_single_call(
     
     # Build course context
     spanish_course = is_spanish_course(course_data)
+    audience_profile = resolve_audience_profile(course_data)
     print(f"🌐 spanish_course={spanish_course} (outline language field={course_data.get('language', '')!r})")
+    print(
+        f"👥 audience_profile={audience_profile.get('profile')} "
+        f"(copilot_productivity={audience_profile.get('is_copilot_productivity')})"
+    )
     module_term = "Capítulo" if spanish_course else "Module"
     lesson_term = "Lección" if spanish_course else "Lesson"
     course_context = build_course_context(
@@ -396,8 +412,25 @@ def generate_batch_single_call(
 
     # Build lesson specifications
     lesson_specs = []
+    lecciones_del_lote = []
     for i, lesson in enumerate(batch_lessons, start=batch_start_idx):
+        lesson = promover_teoria_a_demo(lesson, audience_profile)
+        lecciones_del_lote.append(lesson)
+    generate_batch_single_call.ultimo_ratio = {}
+    if os.environ.get("THEORY_DEMO_RATIO", "1") != "0":
+        try:
+            generate_batch_single_call.ultimo_ratio = ratio_teoria_demo(lecciones_del_lote)
+        except Exception as ratio_exc:
+            print(f"theory/demo ratio skipped: {ratio_exc}")
+        l_is_lab = is_lab_lesson(lesson)
+        l_is_demo = is_demo_lesson(lesson)
         target_words = calculate_target_words(lesson, module_data)
+        if not l_is_lab and not l_is_demo:
+            target_words = scale_theory_target_words(
+                target_words,
+                audience_profile,
+                is_lab_or_demo=False,
+            )
 
         topics_list = lesson.get('topics', [])
         topics_formatted = []
@@ -421,8 +454,6 @@ def generate_batch_single_call(
                 labs_formatted.append(f"      - {str(l)}")
         labs_str = "\n".join(labs_formatted)
 
-        l_is_lab = is_lab_lesson(lesson)
-        l_is_demo = is_demo_lesson(lesson)
         if l_is_lab:
             l_title = lesson.get('title', 'Untitled')
             if l_is_demo:
@@ -440,6 +471,17 @@ def generate_batch_single_call(
     4. ## Resumen de la Demostración (Contexto, conceptos demostrados por el instructor y duración estimada)
     5. ## Referencias Bibliográficas (enlaces https válidos)
 """
+                pasos_demo = lesson.get("demo_steps") or []
+                esperado_demo = lesson.get("expected_result") or ""
+                if pasos_demo or esperado_demo:
+                    lineas_demo = ["    PASOS DEL INSTRUCTOR / INSTRUCTOR STEPS:"]
+                    for numero, paso in enumerate(pasos_demo, 1):
+                        lineas_demo.append(f"    {numero}. {paso}")
+                    if esperado_demo:
+                        lineas_demo.append(
+                            f"    RESULTADO ESPERADO / EXPECTED RESULT: {esperado_demo}"
+                        )
+                    spec += "\n" + "\n".join(lineas_demo) + "\n"
             else:
                 spec = f"""
     {lesson_term} {i + 1}: {l_title} (TIPO: LABORATORIO / ACTIVIDAD PRÁCTICA)
@@ -811,9 +853,13 @@ CRÍTICO: El contenido de todas las lecciones DEBE estar 100% estrictamente alin
         else ""
     )
 
+    audience_adaptation_section = content_audience_block(audience_profile, spanish_course)
+
     prompt = f"""{role_line}
 
 {language_directive}
+
+{audience_adaptation_section}
 
 {manual_alignment_directive}
 
@@ -901,80 +947,104 @@ CRÍTICO: El contenido de todas las lecciones DEBE estar 100% estrictamente alin
         raise
 
 
-def call_bedrock(prompt: str, model_id: str = DEFAULT_BEDROCK_MODEL) -> str:
-    """Call AWS Bedrock Claude API with app-level backoff and fallback model sequence."""
-    candidate_models = [
-        model_id,
-        "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-        "us.anthropic.claude-3-5-haiku-20241022-v1:0",
-        "us.anthropic.claude-3-haiku-20240307-v1:0",
-        "amazon.nova-pro-v1:0"
-    ]
-    # Deduplicate while preserving order
-    seen = set()
-    models_to_try = []
-    for m in candidate_models:
-        if m and m not in seen:
-            seen.add(m)
-            models_to_try.append(m)
+_modelo_de_leccion = {"id": None}
 
-    last_err: Optional[Exception] = None
 
-    for m_id in models_to_try:
-        request_body = {
-            "max_tokens": 32000,
-            "temperature": 0.7,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        }
-        if "anthropic" in m_id:
-            request_body["anthropic_version"] = "bedrock-2023-05-31"
+def _texto_de_bedrock(response_body: dict, model_id: str) -> str:
+    if response_body.get("content"):
+        return response_body["content"][0].get("text") or ""
+    salida = (response_body.get("output") or {}).get("message") or {}
+    contenido = salida.get("content") or []
+    if contenido and contenido[0].get("text"):
+        return contenido[0]["text"]
+    raise ValueError(f"No content in Bedrock response for model {model_id}")
 
-        print(f"🤖 Attempting Bedrock model: {m_id}")
-        for attempt in range(1, BEDROCK_APP_MAX_ATTEMPTS + 1):
-            try:
-                response = bedrock_client.invoke_model(
-                    modelId=m_id,
-                    body=json.dumps(request_body),
-                    contentType='application/json',
-                    accept='application/json'
-                )
-                response_body = json.loads(response['body'].read())
-                if 'content' in response_body and len(response_body['content']) > 0:
-                    return response_body['content'][0]['text']
-                elif 'output' in response_body and 'message' in response_body['output']:
-                    # Amazon Nova format
-                    content_list = response_body['output']['message'].get('content', [])
-                    if content_list and 'text' in content_list[0]:
-                        return content_list[0]['text']
-                raise ValueError(f"No content in Bedrock response for model {m_id}")
-            except Exception as e:
-                last_err = e
-                err_str = str(e)
-                print(f"Bedrock API Error ({m_id}, attempt {attempt}/{BEDROCK_APP_MAX_ATTEMPTS}): {err_str}")
-                if "Too many tokens per day" in err_str or "ThrottlingException" in err_str:
-                    print(f"⚠️ Model {m_id} quota/rate limit exceeded. Trying next fallback model...")
-                    break
-                if attempt < BEDROCK_APP_MAX_ATTEMPTS and _bedrock_error_is_transient(e):
-                    _sleep_before_bedrock_retry(attempt - 1)
-                    continue
-                break
 
-    # If all Bedrock models failed, attempt Google Gemini fallback if key is available
+def _invoke_bedrock_content(prompt: str, model_id: str) -> str:
+    request_body = {
+        "max_tokens": 32000,
+        "temperature": 0.7,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if "anthropic" in model_id:
+        request_body["anthropic_version"] = "bedrock-2023-05-31"
+    response = bedrock_client.invoke_model(
+        modelId=model_id,
+        body=json.dumps(request_body),
+        contentType="application/json",
+        accept="application/json",
+    )
+    return _texto_de_bedrock(json.loads(response["body"].read()), model_id)
+
+
+def _respaldo_openai_o_gemini_contenido(prompt: str) -> Optional[str]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        try:
+            secret = get_secret("aurora/openai-api-key")
+            api_key = (secret or {}).get("api_key")
+        except Exception as exc:
+            print(f"⚠️ OpenAI key unavailable: {exc}")
+    if api_key:
+        try:
+            text = call_openai(prompt, api_key)
+            _modelo_de_leccion["id"] = DEFAULT_OPENAI_MODEL
+            return text
+        except Exception as exc:
+            print(f"⚠️ OpenAI fallback failed: {exc}")
     try:
         google_key = get_google_api_key()
         if google_key:
-            print("⚠️ All Bedrock models failed or throttled. Attempting fallback to Google Gemini...")
-            return call_gemini(prompt, google_key)
-    except Exception as g_err:
-        print(f"⚠️ Gemini fallback also failed: {g_err}")
+            text = call_gemini(prompt, google_key)
+            _modelo_de_leccion["id"] = "gemini"
+            return text
+    except Exception as exc:
+        print(f"⚠️ Gemini fallback failed: {exc}")
+    return None
 
-    assert last_err is not None
-    raise last_err
+
+def call_bedrock(prompt: str, model_id: str = DEFAULT_BEDROCK_MODEL) -> str:
+    """Per-minute backoff, then BEDROCK_FALLBACK_MODELS, then OpenAI/Gemini if configured.
+
+    A ThrottlingException that mentions ``per day``, or ServiceQuotaExceeded,
+    switches immediately. Per-minute throttling sleeps first.
+    """
+    try:
+        text, used = run_model_chain(
+            lambda mid: _invoke_bedrock_content(prompt, mid),
+            fallback_model_ids(model_id),
+            max_attempts=BEDROCK_APP_MAX_ATTEMPTS,
+            sleep=_sleep_before_bedrock_retry,
+            is_transient=_bedrock_error_is_transient,
+        )
+        _modelo_de_leccion["id"] = used
+        if used != model_id:
+            print(f"🔄 Content answered with fallback model {used}")
+        return text
+    except Exception as bedrock_err:
+        print(f"❌ Content Bedrock chain failed: {bedrock_err}")
+        alterno = _respaldo_openai_o_gemini_contenido(prompt)
+        if alterno:
+            return alterno
+        raise
+
+
+def leccion_pendiente(titulo: str, en_espanol: bool = True) -> str:
+    """Text-only placeholder lesson. Spanish first, then English. The batch still returns 200."""
+    titulo = (titulo or "Lección").strip()
+    return f"""# {titulo}
+
+> **PENDIENTE DE REGENERACIÓN / PENDING REGENERATION**
+>
+> Esta lección no pudo generarse y se entrega como texto provisional, sin imágenes.
+> This lesson could not be generated and is delivered as provisional text, without images.
+>
+> <!-- {MARCA_PLACEHOLDER_LECCION} -->
+
+## Resumen / Summary
+
+El contenido de esta lección está pendiente de regeneración. / This lesson is pending regeneration.
+"""
 
 
 def call_openai(prompt: str, api_key: str, model: str = DEFAULT_OPENAI_MODEL) -> str:
@@ -1064,6 +1134,79 @@ def parse_lessons_from_response(
         print(f"  ✅ Lesson {lesson_index + 1}: {lesson_title} ({word_count} words)")
     
     return parsed_lessons
+
+
+def _lecciones_placeholder_si_se_puede(event: dict, exc: Exception) -> Optional[dict]:
+    """Write one text-only placeholder per lesson in the batch and return 200."""
+    if not isinstance(event, dict):
+        return None
+    bucket = event.get("course_bucket")
+    project = event.get("project_folder")
+    module_num = event.get("module_number")
+    if not bucket or not project or not module_num:
+        return None
+    outline_key = event.get("outline_s3_key")
+    if not outline_key:
+        return None
+    try:
+        outline_obj = s3_client.get_object(Bucket=bucket, Key=outline_key)
+        outline_data = yaml.safe_load(outline_obj["Body"].read().decode("utf-8"))
+    except Exception as carga:
+        print(f"⚠️ Cannot load outline for placeholders: {carga}")
+        return None
+    course_data = outline_data.get("course", outline_data)
+    modules = course_data.get("modules") or []
+    try:
+        module_index = int(module_num) - 1
+        module_data = modules[module_index]
+    except (TypeError, ValueError, IndexError):
+        return None
+    lecciones = module_data.get("lessons") or []
+    inicio = int(event.get("batch_start_idx") or 0)
+    fin = event.get("batch_end_idx")
+    fin = int(fin) if fin is not None else len(lecciones)
+    idioma = str(course_data.get("language") or "es").lower()
+    en_espanol = not idioma.startswith("en")
+    claves = []
+    for offset, lesson_data in enumerate(lecciones[inicio:fin]):
+        indice = inicio + offset
+        titulo = (lesson_data or {}).get("title") or f"Leccion {indice + 1}"
+        filename = format_lesson_filename(int(module_num), indice, titulo)
+        key = f"{project}/lessons/{filename}"
+        try:
+            s3_client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=leccion_pendiente(titulo, en_espanol).encode("utf-8"),
+                ContentType="text/markdown",
+            )
+        except Exception as escritura:
+            print(f"⚠️ Could not write placeholder {key}: {escritura}")
+            continue
+        claves.append(
+            {
+                "s3_key": key,
+                "module_number": int(module_num),
+                "lesson_number": indice + 1,
+                "lesson_title": titulo,
+                "placeholder": True,
+            }
+        )
+    if not claves:
+        return None
+    print(f"⚠️ Returning {len(claves)} placeholder lesson(s) after {type(exc).__name__}")
+    return {
+        "statusCode": 200,
+        "message": "PENDIENTE DE REGENERACIÓN / PENDING REGENERATION",
+        "lesson_keys": claves,
+        "bucket": bucket,
+        "project_folder": project,
+        "module_number": int(module_num),
+        "batch_index": event.get("batch_index"),
+        "placeholder": True,
+        "quality_warning": f"theory batch placeholder: {exc}"[:500],
+        "model_used": _modelo_de_leccion.get("id") or "",
+    }
 
 
 def lambda_handler(event, context):
@@ -1222,7 +1365,10 @@ def lambda_handler(event, context):
                         'lessons_generated': 0,
                         'total_words': existing_total_words,
                         'model_provider': model_provider,
-                        'skipped': True
+                        'skipped': True,
+                        'placeholder': False,
+                        'quality_warning': '',
+                        'model_used': '',
                     }
             except Exception as e:
                 print(f"⚠️  Idempotency check failed: {e} (proceeding with generation)")
@@ -1246,6 +1392,13 @@ def lambda_handler(event, context):
             module_data=module_data,
             course_data={
                 'title': course_info.get('title', course_data.get('title', 'Course')),
+                'description': course_info.get('description', course_data.get('description', '')),
+                'audience': course_info.get('audience', course_data.get('audience')),
+                'target_audience': course_info.get('target_audience', course_data.get('target_audience')),
+                'total_duration_minutes': course_info.get(
+                    'total_duration_minutes', course_data.get('total_duration_minutes')
+                ),
+                'duration_minutes': course_info.get('duration_minutes', course_data.get('duration_minutes')),
                 'modules': modules,
                 'language': outline_lang_raw,
             },
@@ -1265,10 +1418,16 @@ def lambda_handler(event, context):
         for lesson in generated_lessons:
             lesson_key = f"{project_folder}/lessons/{lesson['filename']}"
             
+            try:
+                cuerpo_leccion = reparar_markdown(lesson['lesson_content'])
+            except Exception as repair_exc:
+                print(f"  ⚠️ Markdown repair skipped for {lesson_key}: {repair_exc}")
+                cuerpo_leccion = lesson['lesson_content']
+            lesson['lesson_content'] = cuerpo_leccion
             s3_client.put_object(
                 Bucket=course_bucket,
                 Key=lesson_key,
-                Body=lesson['lesson_content'].encode('utf-8'),
+                Body=cuerpo_leccion.encode('utf-8'),
                 ContentType='text/markdown'
             )
             
@@ -1290,7 +1449,7 @@ def lambda_handler(event, context):
         print(f"📊 Total words: {total_words:,}")
         print(f"{'='*70}")
         
-        return {
+        respuesta = {
             'statusCode': 200,
             'message': f'Batch {batch_index}/{total_batches} completed successfully',
             'lesson_keys': lesson_keys,  # Required by Step Functions
@@ -1301,14 +1460,23 @@ def lambda_handler(event, context):
             'total_batches': total_batches,
             'lessons_generated': len(generated_lessons),
             'total_words': total_words,
-            'model_provider': model_provider
+            'model_provider': model_provider,
+            'placeholder': False,
+            'quality_warning': '',
+            'model_used': _modelo_de_leccion.get('id') or model_provider,
         }
+        ratio = getattr(generate_batch_single_call, "ultimo_ratio", None)
+        if ratio:
+            respuesta["theory_demo_ratio"] = ratio
+        return respuesta
     
     except Exception as e:
         print(f"❌ Error: {str(e)}")
         import traceback
         traceback.print_exc()
-        
+        placeholder = _lecciones_placeholder_si_se_puede(event, e)
+        if placeholder:
+            return placeholder
         return {
             'statusCode': 500,
             'error': str(e),

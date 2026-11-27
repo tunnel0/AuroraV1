@@ -33,7 +33,19 @@ from botocore.exceptions import ClientError
 from jinja2 import Template
 from xhtml2pdf import pisa
 
+from setup_guide_capabilities import (
+    filter_hardware_requirements,
+    filter_software_requirements,
+    software_to_capabilities,
+    syllabus_requirement_corpus,
+)
 from setup_guide_template import SETUP_GUIDE_TEMPLATE
+from template_tokens import (
+    construir_catalogo,
+    finalizar_tokens,
+    quality_issue_de_tokens,
+    reemplazar_texto,
+)
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -110,6 +122,123 @@ def truncate(text, limit=320):
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "\u2026"
+
+
+# An 8-column table on A4 (about 487 pt inside the 1.9 cm margins) overflows
+# the frame when a practice title is a paragraph. These widths sum to 420 pt.
+# Cell padding is extra, so the sum stays under the frame even when xhtml2pdf
+# adds it outside the width. Every cell is later checked as a Paragraph.
+_ANCHO_CELDA_PT = {
+    "name": 72,
+    "objective": 66,
+    "duration": 32,
+    "dependencies": 54,
+    "initial_state": 54,
+    "expected_result": 54,
+    "evidence": 52,
+    "access": 36,
+}
+_LIMITE_ETIQUETA_LAB = 60
+_LIMITE_CELDA = {
+    "objective": 80,
+    "dependencies": 70,
+    "initial_state": 70,
+    "expected_result": 70,
+    "evidence": 70,
+}
+
+
+def sin_sintaxis_de_tabla(texto):
+    """Drop markdown table rows. A raw ``| col | col |`` fragment is not a cell."""
+    lineas = []
+    for linea in (texto or "").splitlines():
+        cruda = linea.strip()
+        if not cruda:
+            continue
+        if cruda.startswith("|") or cruda.count("|") >= 2:
+            continue
+        if re.match(r"^\|?\s*:?-{3,}", cruda):
+            continue
+        lineas.append(linea)
+    return "\n".join(lineas)
+
+
+def resumir_celda(texto, limite):
+    """One short sentence: no markdown table, no fenced prompt, ellipsis if needed."""
+    limpio = sin_sintaxis_de_tabla(texto or "")
+    limpio = re.sub(r"```.*?```", " ", limpio, flags=re.DOTALL)
+    limpio = clean_inline(limpio).replace("|", " ")
+    limpio = re.sub(r"\s+", " ", limpio).strip()
+    if not limpio:
+        return ""
+    frase = re.split(r"(?<=[.!?])\s+", limpio, maxsplit=1)[0]
+    return truncate(frase or limpio, limite)
+
+
+def etiqueta_de_laboratorio(lab_id, titulo, limite=_LIMITE_ETIQUETA_LAB):
+    """Lab cell is the id plus the title, about 60 characters."""
+    titulo = clean_inline(titulo)
+    ident = (lab_id or "").strip()
+    base = f"{ident} {titulo}".strip() if ident else titulo
+    return truncate(base, limite)
+
+
+def _romper_token_largo(texto, cada=16):
+    """Soft hyphens so a single token can wrap inside a narrow Paragraph."""
+
+    def partir(coincidencia):
+        palabra = coincidencia.group(0)
+        return "\u00ad".join(palabra[i:i + cada] for i in range(0, len(palabra), cada))
+
+    return re.sub(r"\S{24,}", partir, texto or "")
+
+
+def caber_en_columna(texto, ancho_pt, font_size=7.5):
+    """Truncate until a Paragraph's minimum width fits the column.
+
+    reportlab raises LayoutError when a flowable is wider than its cell or
+    frame (``allowTableBoundsErrors`` off, or the table itself wider than the
+    page). Measuring with the same Paragraph class is what keeps the cell
+    inside the frame. The returned string still wraps; the ellipsis is only
+    the overflow that cannot.
+    """
+    from xml.sax.saxutils import escape
+
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import Paragraph
+
+    visible = _romper_token_largo(clean_inline(texto))
+    if not visible:
+        return ""
+    estilo = ParagraphStyle(
+        "sug-celda",
+        fontName="Helvetica",
+        fontSize=font_size,
+        leading=font_size * 1.15,
+    )
+    for _ in range(60):
+        parrafo = Paragraph(escape(visible), estilo)
+        if parrafo.minWidth() <= float(ancho_pt) + 0.5:
+            return visible
+        if len(visible) <= 4:
+            return (visible[:1] + "\u2026") if visible else ""
+        visible = visible[:-4].rstrip(" \u00ad") + "\u2026"
+    return visible
+
+
+def ajustar_celdas_de_matriz(fila):
+    """Every lab-matrix cell is a short Paragraph that fits its column."""
+    ajustada = dict(fila)
+    for campo, ancho in _ANCHO_CELDA_PT.items():
+        if campo == "access":
+            acceso = dict(fila.get("access") or {})
+            acceso["label"] = caber_en_columna(acceso.get("label") or "", ancho)
+            ajustada["access"] = acceso
+            continue
+        if campo not in fila:
+            continue
+        ajustada[campo] = caber_en_columna(fila.get(campo) or "", ancho)
+    return ajustada
 
 
 # ---------------------------------------------------------------------------
@@ -514,10 +643,13 @@ def build_previous_knowledge(course_meta, master_plan):
     }
 
 
-def build_software(master_plan):
+def build_software(master_plan, allowed_corpus=None):
     software = []
     seen_names = []
-    for item in master_plan.get("software_requirements", []) or []:
+    raw_requirements = master_plan.get("software_requirements", []) or []
+    if allowed_corpus is not None:
+        raw_requirements = filter_software_requirements(raw_requirements, allowed_corpus)
+    for item in raw_requirements:
         if not isinstance(item, dict) or not item.get("name"):
             continue
         name = clean_inline(item.get("name"))
@@ -622,10 +754,9 @@ def build_troubleshooting(labs):
 def build_checklist(course_meta):
     return [
         "Repositorio y enlaces de cada laboratorio verificados.",
-        "Versiones exactas documentadas y probadas.",
-        "CPU, RAM, discos y adaptadores de red confirmados.",
-        "Sistema actualizado sin errores críticos.",
-        "Software, archivos, cuentas, licencias y permisos disponibles.",
+        "Licencias, cuentas, permisos y accesos a servicios confirmados.",
+        "Capacidades declaradas disponibles antes del inicio del curso.",
+        "CPU, RAM y conectividad confirmados solo cuando el temario los exige.",
         "Prueba completa ejecutada desde un entorno limpio.",
     ]
 
@@ -655,10 +786,10 @@ def build_lab_matrix(master_plan, labs, repo_url):
         dependencies = ", ".join(clean_inline(p) for p in prereq) if prereq else "[SIN DEPENDENCIAS DECLARADAS]"
 
         initial_state = ""
-        env_clean = "\n".join(
+        env_clean = sin_sintaxis_de_tabla("\n".join(
             line for line in env.splitlines()
             if not line.strip().startswith("```") and not re.match(r"^\s*(bash|sh|shell|powershell)\s*$", line.strip(), re.IGNORECASE)
-        )
+        ))
         for line in env_clean.splitlines():
             if re.search(r"(?i)estado inicial", line):
                 initial_state = clean_inline(line.split(":", 1)[-1])
@@ -687,11 +818,12 @@ def build_lab_matrix(master_plan, labs, repo_url):
             )
 
         evidence = ""
-        validation_codes = extract_code_blocks(validation)
+        validacion_limpia = sin_sintaxis_de_tabla(validation)
+        validation_codes = extract_code_blocks(validacion_limpia)
         if validation_codes:
-            evidence = " | ".join(clean_inline(c) for c in validation_codes[0].splitlines()[:2])
+            evidence = resumir_celda(validation_codes[0], _LIMITE_CELDA["evidence"])
         if not evidence:
-            evidence = first_paragraph(validation) or "[EVIDENCIA POR DEFINIR]"
+            evidence = resumir_celda(validacion_limpia, _LIMITE_CELDA["evidence"]) or "[EVIDENCIA POR DEFINIR]"
 
         duration = plan.get("estimated_duration") or plan.get("duration_minutes")
         duration_text = f"{duration} min" if duration else "[DURACIÓN POR CONFIRMAR]"
@@ -700,20 +832,24 @@ def build_lab_matrix(master_plan, labs, repo_url):
         anchor = re.sub(r"[\s_]+", "-", anchor)
         anchor = re.sub(r"-{2,}", "-", anchor).strip("-") or "laboratorio"
 
-        matrix.append({
+        if not initial_state or initial_state.startswith("|"):
+            initial_state = "Entorno preparado según esta Setup Guide"
+        fila = {
             "number": lab_id or "-",
-            "name": title,
-            "objective": truncate(objective, 180) or "[OBJETIVO POR DEFINIR]",
+            "name": etiqueta_de_laboratorio(lab_id, title),
+            "objective": resumir_celda(objective, _LIMITE_CELDA["objective"]) or "[OBJETIVO POR DEFINIR]",
             "duration": duration_text,
-            "dependencies": truncate(dependencies, 140),
-            "initial_state": truncate(initial_state, 140),
-            "expected_result": truncate(expected, 160),
-            "evidence": truncate(evidence, 160),
+            "dependencies": resumir_celda(dependencies, _LIMITE_CELDA["dependencies"]),
+            "initial_state": resumir_celda(initial_state, _LIMITE_CELDA["initial_state"])
+            or "Entorno preparado según esta Setup Guide",
+            "expected_result": resumir_celda(expected, _LIMITE_CELDA["expected_result"]),
+            "evidence": evidence,
             "access": {
                 "label": f"Capítulo {module_number:02d}",
                 "url": f"{repo_url}/blob/main/Capitulo{module_number:02d}/README.md#{anchor}",
             },
-        })
+        }
+        matrix.append(ajustar_celdas_de_matriz(fila))
     return matrix
 
 
@@ -722,9 +858,16 @@ def build_setup_guide(bucket, project_folder, outline_key, outline_data, master_
     repo_url = repo_url_for(project_folder)
     repo_ok = repo_exists(repo_url)
 
-    hardware_rows = build_hardware(master_plan)
-    counters = build_counters(hardware_rows, master_plan)
-    software = build_software(master_plan)
+    allowed_corpus = syllabus_requirement_corpus(course_meta, master_plan, outline_data)
+    plan_for_guide = dict(master_plan)
+    plan_for_guide["hardware_requirements"] = filter_hardware_requirements(
+        master_plan.get("hardware_requirements", []) or [], allowed_corpus
+    )
+
+    hardware_rows = build_hardware(plan_for_guide)
+    counters = build_counters(hardware_rows, plan_for_guide)
+    software = build_software(plan_for_guide, allowed_corpus)
+    capabilities = software_to_capabilities(software)
     preparation = build_preparation(master_plan, labs)
     previous_knowledge = build_previous_knowledge(course_meta, master_plan)
     accesses = build_accesses(master_plan)
@@ -765,6 +908,7 @@ def build_setup_guide(bucket, project_folder, outline_key, outline_data, master_
             "last_validation": PH_DATE,
             "source": {"outline": outline_key, "master_plan": f"{project_folder}/labguide/lab-master-plan.json" if master_plan else None, "labs": sorted(labs.keys())},
             "placeholders_count": 0,
+            "repo_url": repo_url,
         },
         "identification": {
             "title": course_meta["title"],
@@ -781,6 +925,8 @@ def build_setup_guide(bucket, project_folder, outline_key, outline_data, master_
             "virtual_machines": [],
             "network": previous_knowledge["network"],
         },
+        "capabilities_profile": "license_access_permission",
+        "capabilities": capabilities,
         "software": software,
         # La petición del curso es fuente de requisitos (opcional): si el cliente
         # pidió versiones o equipamiento, la guía debe decirlo aunque el plan no lo
@@ -797,12 +943,9 @@ def build_setup_guide(bucket, project_folder, outline_key, outline_data, master_
         "placeholders": [],
     }
 
-    pending_versions = sum(1 for s in software if s.get("pending"))
-    doc["metadata"]["placeholders_count"] = (
-        pending_versions
-        + sum(1 for link in identification_links if not link["url"])
-        + (0 if repo_ok else 1)
-    )
+    # placeholders_count is filled by finalizar_tokens from the real brackets.
+    # The old total (pending rows + empty links) did not match placeholders,
+    # which stayed [] while the JSON still contained [VERSIÓN POR VALIDAR].
 
     # Fallback de descripción
     if not doc["identification"]["description"]:
@@ -821,7 +964,7 @@ def build_setup_guide(bucket, project_folder, outline_key, outline_data, master_
 # ---------------------------------------------------------------------------
 # Render PDF
 # ---------------------------------------------------------------------------
-def render_pdf(doc, bucket, author="Aurora AI"):
+def html_de_guia(doc, bucket, author="Aurora AI"):
     local_logo = None
     try:
         local_logo = "/tmp/LogoNetec.png"
@@ -850,6 +993,7 @@ def render_pdf(doc, bucket, author="Aurora AI"):
         "previous_knowledge": doc["previous_knowledge"],
         "infrastructure": doc["infrastructure"],
         "counters": doc["infrastructure"]["counters"],
+        "capabilities": doc.get("capabilities", []),
         "software": doc["software"],
         "additional_requirements": doc.get("additional_requirements", ""),
         "accesses": doc["accesses"],
@@ -858,17 +1002,171 @@ def render_pdf(doc, bucket, author="Aurora AI"):
         "lab_matrix": doc["lab_matrix"],
         "references": doc["references"],
     }
-    html = Template(SETUP_GUIDE_TEMPLATE).render(context)
+    return Template(SETUP_GUIDE_TEMPLATE).render(context)
+
+
+def render_pdf(doc, bucket, author="Aurora AI"):
+    """PDF with template brackets already replaced. The handler records them first."""
+    html, _pendientes, _rellenos = reemplazar_texto(
+        html_de_guia(doc, bucket, author), {"software": {}, "llm": {}}
+    )
+    return _pdf_desde_html(html)
+
+
+def _llm_una_vez(tokens, catalogo):
+    """One model call. Any failure leaves the tokens for the neutral sentence."""
+    if os.getenv("SETUP_GUIDE_LLM", "1") == "0":
+        return {}
+    if os.getenv("AWS_EC2_METADATA_DISABLED") == "true" and not os.getenv("AWS_ACCESS_KEY_ID"):
+        return {}
+    if not tokens:
+        return {}
+    try:
+        from botocore.config import Config
+
+        cliente = boto3.client(
+            "bedrock-runtime",
+            config=Config(connect_timeout=2, read_timeout=8, retries={"max_attempts": 0}),
+        )
+        contexto = {
+            "course_version": catalogo.get("course_version"),
+            "generated_on": catalogo.get("generated_on"),
+            "software": catalogo.get("software") or {},
+            "commands": (catalogo.get("commands") or [])[:8],
+            "urls_permitidas": catalogo.get("urls_permitidas") or [],
+            "license": catalogo.get("license") or "",
+        }
+        prompt = (
+            "Completa solo los tokens cuyo valor ya está en el contexto. "
+            "URLs: solo las de urls_permitidas (documentación oficial del fabricante). "
+            "Comandos de prueba: cópialos de los pasos del laboratorio. "
+            "Versiones y licencias: solo si constan en el contexto. "
+            "No inventes enlaces, contraseñas ni claves. Si no consta, omite la clave. "
+            "Responde un JSON objeto token -> texto. "
+            "Fill only tokens whose value is already in the context. "
+            "URLs: only those in urls_permitidas (official vendor documentation). "
+            "Test commands: copy them from the lab steps. "
+            "Versions and licenses: only when the context states them. "
+            "Do not invent links, passwords, or keys. If it is absent, omit the key. "
+            "Reply with a JSON object token -> text.\n"
+            f"tokens={json.dumps(tokens, ensure_ascii=False)}\n"
+            f"context={json.dumps(contexto, ensure_ascii=False)[:4000]}"
+        )
+        modelo = os.getenv("SETUP_GUIDE_LLM_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
+        respuesta = cliente.converse(
+            modelId=modelo,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": 600, "temperature": 0},
+        )
+        texto = respuesta["output"]["message"]["content"][0]["text"]
+        inicio = texto.find("{")
+        fin = texto.rfind("}")
+        if inicio < 0 or fin <= inicio:
+            return {}
+        return json.loads(texto[inicio:fin + 1])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Setup Guide token fill skipped: %s", exc)
+        return {}
+
+
+_MAX_FILAS_POR_TABLA = 4
+_MAX_CHARS_CELDA_PDF = 320
+_TABLA_HTML = re.compile(r"(<table\b[^>]*>)(.*?)(</table>)", re.IGNORECASE | re.DOTALL)
+_FILA_HTML = re.compile(r"<tr\b[^>]*>.*?</tr>", re.IGNORECASE | re.DOTALL)
+_CELDA_HTML = re.compile(r"(<(td|th)\b[^>]*>)(.*?)(</\2>)", re.IGNORECASE | re.DOTALL)
+
+
+def _acortar_texto_de_celda(contenido: str, limite: int = _MAX_CHARS_CELDA_PDF) -> str:
+    """Cap a cell and break long tokens so one row cannot be taller than the page."""
+
+    def romper(coincidencia):
+        palabra = coincidencia.group(0)
+        return "&#8203;".join(palabra[i:i + 24] for i in range(0, len(palabra), 24))
+
+    texto = re.sub(r"<[^>]+>", "", contenido or "")
+    if len(texto) > limite:
+        if "<" in (contenido or ""):
+            contenido = texto[: limite - 1].rstrip() + "…"
+        else:
+            contenido = (contenido or "")[: limite - 1].rstrip() + "…"
+    return re.sub(r"\S{40,}", romper, contenido or "")
+
+
+def partir_tablas_altas(html: str, max_filas: int = _MAX_FILAS_POR_TABLA) -> str:
+    """Split a tall table and shrink its cells.
+
+    reportlab names the flowable ``Table ... 2x8`` (columns x rows) and raises
+    LayoutError when that table is taller than the frame and rows do not split.
+    Repeating the header every few rows keeps each piece inside the page.
+    """
+
+    def una_tabla(coincidencia):
+        apertura, cuerpo, cierre = coincidencia.group(1), coincidencia.group(2), coincidencia.group(3)
+        filas = _FILA_HTML.findall(cuerpo)
+        if not filas:
+            return coincidencia.group(0)
+
+        def celdas(fragmento):
+            return _CELDA_HTML.sub(
+                lambda celda: celda.group(1) + _acortar_texto_de_celda(celda.group(3)) + celda.group(4),
+                fragmento,
+            )
+
+        if len(filas) <= max_filas:
+            return apertura + celdas(cuerpo) + cierre
+        encabezado = filas[0] if "<th" in filas[0].lower() else ""
+        datos = filas[1:] if encabezado else filas
+        trozos = []
+        for inicio in range(0, len(datos), max_filas):
+            bloque = encabezado + "".join(datos[inicio:inicio + max_filas])
+            trozos.append(apertura + celdas(bloque) + cierre)
+        return "\n".join(trozos)
+
+    return _TABLA_HTML.sub(una_tabla, html or "")
+
+
+def _pdf_desde_html(html):
+    """Render and refuse a silent layout failure.
+
+    A reportlab LayoutError used to end the task in the Setup Guide catch
+    while the execution still finished SUCCEEDED and the PDF was missing.
+    Tall tables are split first. A second render allows row shrinking.
+    If both fail, the error stays on ``setup_guide_error``.
+    """
+    from reportlab.platypus.doctemplate import LayoutError
+
+    html = partir_tablas_altas(html)
     pdf_buffer = BytesIO()
-    result = pisa.CreatePDF(html, dest=pdf_buffer)
+    try:
+        result = pisa.CreatePDF(html, dest=pdf_buffer)
+    except LayoutError:
+        pdf_buffer = BytesIO()
+        encogido = html.replace(
+            "<table",
+            '<table style="-pdf-keep-in-frame-mode: shrink"',
+        )
+        try:
+            result = pisa.CreatePDF(encogido, dest=pdf_buffer)
+        except LayoutError as exc:
+            raise RuntimeError(f"Setup Guide PDF layout failed: {exc}") from exc
     if result.err:
         raise RuntimeError("La generación del PDF falló (pisa error)")
-    return pdf_buffer.getvalue()
+    datos = pdf_buffer.getvalue()
+    if not datos.startswith(b"%PDF"):
+        raise RuntimeError("La generación del PDF no produjo un documento")
+    return datos
 
 
 # ---------------------------------------------------------------------------
 # Handler
 # ---------------------------------------------------------------------------
+def is_api_gateway_event(event):
+    """Step Functions passes the payload dict; API Gateway wraps it."""
+    if not isinstance(event, dict):
+        return False
+    return bool(event.get("requestContext") or event.get("httpMethod") or event.get("headers"))
+
+
 def parse_event_body(event):
     """API Gateway puede codificar el body en base64 (BinaryMediaTypes */*)."""
     import base64
@@ -914,14 +1212,42 @@ def lambda_handler(event, context):
         labs = list_lab_files(bucket, project_folder)
 
         if not outline_key and not master_plan and not labs:
-            return {
-                "statusCode": 404,
-                "headers": cors_headers(),
-                "body": json.dumps({"error": "No se encontró outline, master plan ni laboratorios para el proyecto."}),
-            }
+            message = "No se encontró outline, master plan ni laboratorios para el proyecto."
+            if is_api_gateway_event(event):
+                return {
+                    "statusCode": 404,
+                    "headers": cors_headers(),
+                    "body": json.dumps({"error": message}),
+                }
+            raise FileNotFoundError(message)
 
         doc = build_setup_guide(
             bucket, project_folder, outline_key, outline_data, master_plan, labs
+        )
+        identificacion = doc.get("identification") or {}
+        meta = doc.get("metadata") or {}
+        catalogo = construir_catalogo(
+            {
+                "title": identificacion.get("title") or meta.get("course_title"),
+                "key": identificacion.get("key"),
+                "version": identificacion.get("version"),
+                "description": identificacion.get("description"),
+                "last_validation": meta.get("last_validation"),
+            },
+            master_plan,
+            labs,
+            generated_on=(meta.get("generated_at") or "")[:10],
+            repo_url=meta.get("repo_url"),
+        )
+        doc, html = finalizar_tokens(
+            doc,
+            catalogo,
+            llm=_llm_una_vez,
+            render_html=lambda documento: html_de_guia(documento, bucket),
+        )
+        hallazgo = quality_issue_de_tokens(
+            doc.get("placeholders") or [],
+            (doc.get("metadata") or {}).get("tokens_filled") or 0,
         )
 
         json_key = f"{project_folder}/setupguide/setup-guide.json"
@@ -931,7 +1257,7 @@ def lambda_handler(event, context):
             ContentType="application/json",
         )
 
-        pdf_bytes = render_pdf(doc, bucket)
+        pdf_bytes = _pdf_desde_html(html)
         pdf_key = f"{project_folder}/setupguide/Setup_Guide.pdf"
         s3.put_object(Bucket=bucket, Key=pdf_key, Body=pdf_bytes, ContentType="application/pdf")
 
@@ -941,26 +1267,37 @@ def lambda_handler(event, context):
             ExpiresIn=3600,
         )
         logger.info("Setup Guide generada: %s", pdf_key)
-        return {
+        cuerpo = {
+            "message": "Setup Guide generada correctamente",
+            "project_folder": project_folder,
+            "course_title": doc["metadata"]["course_title"],
+            "course_key": doc["metadata"]["course_key"],
+            "version": doc["metadata"]["version"],
+            "setup_guide_json_key": json_key,
+            "setup_guide_pdf_key": pdf_key,
+            "download_url": download_url,
+            "lab_count": len(doc["lab_matrix"]),
+            "software_count": len(doc["software"]),
+            "placeholders_count": doc["metadata"]["placeholders_count"],
+            "placeholders": doc["placeholders"],
+            "tokens_filled": doc["metadata"].get("tokens_filled", 0),
+            "tokens_neutralized": doc["metadata"].get("tokens_neutralized", 0),
+            "quality_issue": hallazgo,
+        }
+        respuesta = {
             "statusCode": 200,
             "headers": cors_headers(),
-            "body": json.dumps({
-                "message": "Setup Guide generada correctamente",
-                "project_folder": project_folder,
-                "course_title": doc["metadata"]["course_title"],
-                "course_key": doc["metadata"]["course_key"],
-                "version": doc["metadata"]["version"],
-                "setup_guide_json_key": json_key,
-                "setup_guide_pdf_key": pdf_key,
-                "download_url": download_url,
-                "lab_count": len(doc["lab_matrix"]),
-                "software_count": len(doc["software"]),
-                "placeholders_count": doc["metadata"]["placeholders_count"],
-                "placeholders": doc["placeholders"],
-            }),
+            "body": json.dumps(cuerpo),
         }
+        if hallazgo:
+            respuesta["quality_issue"] = hallazgo
+            respuesta["placeholders"] = doc["placeholders"]
+            respuesta["placeholders_count"] = doc["metadata"]["placeholders_count"]
+        return respuesta
     except Exception as exc:  # noqa: BLE001
         logger.error("Error generando Setup Guide: %s", exc, exc_info=True)
+        if not is_api_gateway_event(event):
+            raise
         return {
             "statusCode": 500,
             "headers": cors_headers(),

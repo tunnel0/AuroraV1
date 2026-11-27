@@ -19,6 +19,13 @@ from typing import Dict, List, Any, Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
 
+from markdown_repair import reparar_markdown
+from measurable_evidence import (
+    INVENTED_SECRET_RE,
+    UNMEASURABLE_PHRASE_RE,
+    hallazgos_validacion_no_medible,
+)
+
 # AWS Clients
 s3_client = boto3.client('s3')
 
@@ -94,7 +101,7 @@ class ContentValidator:
     # Visual tag pattern
     VISUAL_TAG_PATTERN = re.compile(r'\[VISUAL: (\d{2})-(\d{2})-(\d{4}) - ([^\]]{10,100})\]')
     INVALID_VISUAL_PATTERNS = [
-        (re.compile(r'\[visual:', re.IGNORECASE), "Lowercase 'visual' - must be uppercase VISUAL"),
+        (re.compile(r'\[(?!VISUAL\s*:)[Vv]isual\s*:'), "Lowercase 'visual' - must be uppercase VISUAL"),
         (re.compile(r'\[VISUAL:[^\s]'), "No space after colon in VISUAL tag"),
         (re.compile(r'\[VISUAL: \d+-\d+-\d+\]'), "Missing description in VISUAL tag"),
         (re.compile(r'\[VISUAL: [^\d]'), "VISUAL tag must start with ID (MM-LL-XXXX)"),
@@ -164,10 +171,8 @@ class ContentValidator:
     VAGUE_VERSION_PATTERN = re.compile(
         r'(?i)\b(latest|\u00faltima|ultima|current|actual|versi\u00f3n actual|reciente|v?\d+\.x|>=|m\u00e1s reciente)\b'
     )
-    UNMEASURABLE_PATTERN = re.compile(
-        r'(?i)(\b\d{1,2}\s*%\s*(de\s*)?(\u00e9xito|exito|success)|'
-        r'\b5\s*(pruebas|tests)\s*gen\u00e9ric|listo para producci\u00f3n|funciona correctamente)'
-    )
+    UNMEASURABLE_PATTERN = UNMEASURABLE_PHRASE_RE
+    INVENTED_SECRET_PATTERN = INVENTED_SECRET_RE
     AI_LIMITATION_PATTERN = re.compile(
         r'(?i)(inexistente|contradictor|prompt\s*injection|inyecci\u00f3n de (prompt|instrucciones)|'
         r'instrucciones incrustadas|sin evidencia|informaci\u00f3n falsa)'
@@ -559,13 +564,23 @@ class ContentValidator:
 
     def validate_evidence_quality(self, content: str) -> None:
         """Mejora THOR: validaci\u00f3n medible y evidencia suficiente."""
-        for match in self.UNMEASURABLE_PATTERN.finditer(content):
+        for mensaje in hallazgos_validacion_no_medible(content):
+            sugerencia = (
+                "Definir criterios medibles y evidencia verificable (comando, salida, captura)."
+            )
+            if "Salida esperada determinista" in mensaje:
+                sugerencia = (
+                    "En pasos con IA, describa elementos requeridos (lista), no el texto literal del modelo."
+                )
+            elif mensaje.startswith("Credencial"):
+                sugerencia = (
+                    "Usar [POR CONFIRMAR] o un valor declarado en el manual; no inventar secretos."
+                )
             self._add_result(
                 "unmeasurable_validation",
                 ValidationSeverity.WARNING,
-                f"Criterio de validaci\u00f3n no medible: '{match.group(0)}'",
-                line_number=self._find_line_number(content, match.group(0)),
-                suggestion="Definir criterios medibles y evidencia verificable (comando, salida, captura)."
+                mensaje,
+                suggestion=sugerencia,
             )
         if "validaci" not in content.lower() and "testing" not in content.lower():
             return
@@ -770,6 +785,23 @@ def lambda_handler(event, context):
             
             try:
                 content = load_content_from_s3(course_bucket, key)
+                try:
+                    reparado = reparar_markdown(content)
+                except Exception as repair_exc:
+                    print(f"  ⚠️ Markdown repair skipped: {repair_exc}")
+                    reparado = content
+                if reparado != content:
+                    try:
+                        s3_client.put_object(
+                            Bucket=course_bucket,
+                            Key=key,
+                            Body=reparado.encode("utf-8"),
+                            ContentType="text/markdown",
+                        )
+                        print(f"  ✏️  Repaired fences or VISUAL markers in {key}")
+                    except Exception as escritura:
+                        print(f"  ⚠️ Could not write the repair back to {key}: {escritura}")
+                    content = reparado
                 
                 # Auto-detect content type
                 detected_type = content_type
@@ -824,6 +856,14 @@ def lambda_handler(event, context):
                 total_errors += 1
         
         all_valid = total_errors == 0
+        invalid_lab_ids = []
+        for item in validation_results:
+            if item.get("is_valid"):
+                continue
+            clave = str(item.get("content_key") or "")
+            hallado = re.search(r"lab-(\d{2}-\d{2}-\d{2})", clave)
+            if hallado and hallado.group(1) not in invalid_lab_ids:
+                invalid_lab_ids.append(hallado.group(1))
         
         print(f"\n{'=' * 70}")
         print(f"📊 VALIDATION SUMMARY")
@@ -838,6 +878,7 @@ def lambda_handler(event, context):
             'validation_results': validation_results,
             'all_valid': all_valid,
             'is_valid': all_valid,
+            'invalid_lab_ids': invalid_lab_ids,
             'total_errors': total_errors,
             'total_warnings': total_warnings,
             'files_validated': len(content_keys)
@@ -853,7 +894,9 @@ def lambda_handler(event, context):
         return {
             'statusCode': 500,
             'error': str(e),
-            'errorType': type(e).__name__
+            'errorType': type(e).__name__,
+            'all_valid': False,
+            'invalid_lab_ids': [],
         }
 
 

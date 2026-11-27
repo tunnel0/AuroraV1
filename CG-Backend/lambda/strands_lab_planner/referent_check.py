@@ -81,7 +81,7 @@ import unicodedata
 
 _EXTENSIONES = (
     "xlsx|xlsm|xls|csv|tsv|md|pbix|pbit|ps1|psm1|py|ipynb|json|txt|zip|rar|7z|"
-    "png|jpg|jpeg|gif|svg|docx|doc|pptx|ppt|pdf|sql|sh|bat|cmd|yaml|yml|log|"
+    "png|jpg|jpeg|gif|svg|docx|doc|eml|pptx|ppt|pdf|sql|sh|bat|cmd|yaml|yml|log|"
     "evtx|pem|pfx|cer|key|bak|db|sqlite|parquet|xml|html|css|js|ts"
 )
 
@@ -200,11 +200,14 @@ def _es_artefacto_de_herramienta(valor: str) -> bool:
     return nombre in _FICHEROS_DE_CHART
 
 # Rutas que no son del sistema de ficheros del alumno sino de una API o de un
-# proveedor cloud (Elasticsearch, OpenAPI, Azure, SharePoint). Tampoco se exigen.
+# proveedor cloud (Elasticsearch, OpenAPI, Azure). Tampoco se exigen.
+# SharePoint (`/sites/`) is course material for this lab, not an API exemption.
 _SEGMENTOS_API = (
     "/subscriptions/", "/resourcegroups/", "/providers/", "/components/schemas/",
     "/_cat/", "/_cluster/", "/_search/", "/_create/", "/_refresh/", "/_doc",
-    "/_bulk", "/_mapping", "/_template/", "/_alias/", "/_index/", "/sites/",
+    # `/sites/` is a SharePoint path the student must have in THIS lab. It is not
+    # an API exemption: an undeclared `/sites/` input is a missing dependency.
+    "/_bulk", "/_mapping", "/_template/", "/_alias/", "/_index/",
     "/settings/", "/api/",
     # Recursos de plataforma vistos en la muestra: CloudWatch (``/aws/lambda/...``),
     # Elasticsearch (``/_snapshot``, ``/_slm``, ``/_security``) y directorios de
@@ -1207,6 +1210,33 @@ _MINUTOS_POR_BLOQUE = 0.75
 _TOLERANCIA_TECHO = 4 / 3
 _TOLERANCIA_SUELO = 5 / 6
 _PASOS_ACCION_MINIMOS = 3
+# Carga en laboratorios GUI / Copilot: prompts, clics, validaciones y lectura.
+_MINUTOS_POR_PROMPT = 0.75
+_MINUTOS_POR_VALIDACION = 1.5
+_PALABRAS_POR_MINUTO_LECTURA = 200
+_LENGUAJES_PROMPT = frozenset({"prompt", "copilot", "ai", "chat", "chatgpt"})
+_LENGUAJES_PROSA_CERCA = frozenset({"", "text", "markdown", "md", "plaintext", "prose"})
+_MARCAS_PROMPT_EN_CERCA = (
+    "copilot", "prompt", "resum", "genera", "redacta", "analiza", "draft",
+    "escribe un", "lista de", "bullet", "tabla con",
+)
+_GUI_INSTRUCCION_RE = re.compile(
+    r"(?i)\b(?:"
+    r"haga clic|haz clic|clic en|clickea|seleccione|selecciona|navegue|navega|"
+    r"abra |abre |pegue|pega |escriba en|inicia sesión|inicia sesion|"
+    r"copilot|outlook|teams|sharepoint|excel en línea|word en línea|pane\b|"
+    r"cinta de opciones|barra lateral|icono de|desde la cinta|menú "
+    r")\b"
+)
+_VALIDACION_EN_PASO_RE = re.compile(
+    r"(?i)\*\*(?:verificaci[oó]n|verification):?\*\*"
+)
+_VALIDACION_SECCION_RE = re.compile(
+    r"^##\s+(?:Validación(?:\s+y\s+Pruebas)?|Validation(?:\s*&\s*Testing)?)\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+_PROMPT_CITA_RE = re.compile(r"^>\s+.{20,}", re.MULTILINE)
+_PALABRA_RE = re.compile(r"\w+", re.UNICODE)
 # Presupuesto de volumen: cuántos pasos y bloques caben en la duración declarada.
 # El objetivo es la **declarada**, no el techo: el 4/3 es el límite duro; el
 # presupuesto reparte la declarada entre pasos y bloques a los ritmos mínimos, para
@@ -1281,45 +1311,123 @@ def duracion_declarada(laboratorio_md: str) -> int | None:
     return max(numeros)
 
 
+def _es_bloque_prompt(lenguaje: str, cuerpo: str) -> bool:
+    """Cerca que el alumno pega en Copilot u otro asistente, no código ejecutable."""
+    lang = (lenguaje or "").strip().lower()
+    if lang in _LENGUAJES_SHELL or lang in _LENGUAJES_ACCION:
+        return False
+    if lang in _LENGUAJES_PROMPT:
+        return True
+    texto = (cuerpo or "").strip()
+    if len(texto) < 25:
+        return False
+    if lang in {"json", "log", "output", "diff", "csv", "text", "html"} and not any(
+        marca in texto.lower() for marca in _MARCAS_PROMPT_EN_CERCA
+    ):
+        return False
+    if lang in _LENGUAJES_PROSA_CERCA or lang == "text":
+        bajo = texto.lower()
+        return any(marca in bajo for marca in _MARCAS_PROMPT_EN_CERCA)
+    return False
+
+
+def _palabras_de_tramo(tramo: str) -> int:
+    """Palabras que el alumno lee en un paso, sin cercas de código."""
+    sin_cercas = _PROSA_RE.sub(" ", tramo or "")
+    return len(_PALABRA_RE.findall(sin_cercas))
+
+
 def carga_de_laboratorio(laboratorio_md: str) -> dict:
-    """Pasos y bloques de acción del laboratorio escrito.
+    """Pasos, bloques de acción y carga de interfaz del laboratorio escrito.
 
     Un **paso con acción** es un ``### Paso`` que contiene al menos un bloque de
     shell o de un lenguaje que el alumno escribe. Los bloques de salida no cuentan.
+    En laboratorios GUI/Copilot también se cuentan prompts en cercas, instrucciones
+  de interfaz, verificaciones y tiempo de lectura (palabras / 200 ppm).
     """
-    cortes = [m.start() for m in _PASO_RE.finditer(laboratorio_md or "")]
+    texto = laboratorio_md or ""
+    cortes = [m.start() for m in _PASO_RE.finditer(texto)]
+    vacio = {
+        "pasos": 0,
+        "con_accion": 0,
+        "shell": 0,
+        "codigo": 0,
+        "bloques": 0,
+        "prompts": 0,
+        "pasos_gui": 0,
+        "validaciones": 0,
+        "palabras": 0,
+        "minutos_lectura": 0,
+    }
     if not cortes:
-        return {"pasos": 0, "con_accion": 0, "shell": 0, "codigo": 0, "bloques": 0}
-    cortes.append(len(laboratorio_md))
-    shell = codigo = con_accion = 0
+        return vacio
+    cortes.append(len(texto))
+    shell = codigo = con_accion = prompts = pasos_gui = validaciones = palabras = 0
     for i in range(len(cortes) - 1):
-        tramo = laboratorio_md[cortes[i]:cortes[i + 1]]
-        tiene = False
-        for lenguaje, _cuerpo in _BLOQUE_RE.findall(tramo):
+        tramo = texto[cortes[i]:cortes[i + 1]]
+        tiene_codigo = False
+        for lenguaje, cuerpo in _BLOQUE_RE.findall(tramo):
             lenguaje = (lenguaje or "").strip().lower()
             if lenguaje in _LENGUAJES_SHELL:
                 shell += 1
-                tiene = True
+                tiene_codigo = True
             elif lenguaje in _LENGUAJES_ACCION:
                 codigo += 1
-                tiene = True
-        if tiene:
+                tiene_codigo = True
+            elif _es_bloque_prompt(lenguaje, cuerpo):
+                prompts += 1
+        prompts += len(_PROMPT_CITA_RE.findall(tramo))
+        validaciones += len(_VALIDACION_EN_PASO_RE.findall(tramo))
+        palabras += _palabras_de_tramo(tramo)
+        if tiene_codigo:
             con_accion += 1
+        elif _GUI_INSTRUCCION_RE.search(tramo) or re.search(
+            r"(?m)^\s*\d+\.\s+\S", tramo
+        ):
+            pasos_gui += 1
+    coincidencia_val = _VALIDACION_SECCION_RE.search(texto)
+    if coincidencia_val:
+        resto = texto[coincidencia_val.end() :]
+        fin = re.search(r"\n##\s+", resto)
+        tramo_val = resto[: fin.start()] if fin else resto
+        validaciones += len(re.findall(r"(?m)^\s*(?:\d+\.|[-*])\s+\S", tramo_val))
+        palabras += _palabras_de_tramo(tramo_val)
+    minutos_lectura = math.ceil(palabras / _PALABRAS_POR_MINUTO_LECTURA) if palabras else 0
     return {
         "pasos": len(cortes) - 1,
         "con_accion": con_accion,
         "shell": shell,
         "codigo": codigo,
         "bloques": shell + codigo,
+        "prompts": prompts,
+        "pasos_gui": pasos_gui,
+        "validaciones": validaciones,
+        "palabras": palabras,
+        "minutos_lectura": minutos_lectura,
     }
+
+
+def _trabajo_minimo_interfaz(unidades: dict) -> float:
+    """Tiempo mínimo en laboratorios GUI/Copilot (prompts, clics, validación, lectura)."""
+    partes = []
+    if unidades.get("prompts"):
+        partes.append(unidades["prompts"] * _MINUTOS_POR_PROMPT)
+    if unidades.get("pasos_gui"):
+        partes.append(unidades["pasos_gui"] * _MINUTOS_POR_PASO_ACCION)
+    if unidades.get("validaciones"):
+        partes.append(unidades["validaciones"] * _MINUTOS_POR_VALIDACION)
+    if unidades.get("minutos_lectura"):
+        partes.append(unidades["minutos_lectura"])
+    return max(partes) if partes else 0.0
 
 
 def auditar_duracion(laboratorio_md: str, duracion_min) -> dict:
     """B6: ¿la duración declarada es compatible con el trabajo que pide el laboratorio?
 
-    Solo se pronuncia cuando hay duración y al menos tres pasos con acción: por
-    debajo de eso, la proporción no significa nada. Es determinista y se calcula
-    sobre el laboratorio escrito, que es donde existen los pasos.
+    Con bloques de shell o código exige al menos tres pasos con acción. Con
+    laboratorios GUI/Copilot también cuenta prompts en cercas, pasos de interfaz,
+    verificaciones y tiempo de lectura (~200 palabras/min). Es determinista y se
+    calcula sobre el laboratorio escrito, que es donde existen los pasos.
     """
     unidades = carga_de_laboratorio(laboratorio_md)
     try:
@@ -1330,31 +1438,54 @@ def auditar_duracion(laboratorio_md: str, duracion_min) -> dict:
     if duracion <= 0:
         informe["motivo"] = "sin duración declarada"
         return informe
-    if unidades["con_accion"] < _PASOS_ACCION_MINIMOS or unidades["bloques"] < 1:
+
+    comparable_codigo = (
+        unidades["con_accion"] >= _PASOS_ACCION_MINIMOS and unidades["bloques"] >= 1
+    )
+    minimo_interfaz = _trabajo_minimo_interfaz(unidades)
+    comparable_interfaz = (
+        unidades["pasos"] >= _PASOS_ACCION_MINIMOS and minimo_interfaz > 0
+    )
+    if not comparable_codigo and not comparable_interfaz:
         informe["motivo"] = "sin pasos de acción suficientes para comparar"
         return informe
-    minutos_paso = duracion / unidades["con_accion"]
-    minutos_bloque = duracion / unidades["bloques"]
-    informe["minutos_por_paso"] = round(minutos_paso, 2)
-    informe["minutos_por_bloque"] = round(minutos_bloque, 2)
+
+    minimo_codigo = 0.0
+    if comparable_codigo:
+        minimo_codigo = max(
+            unidades["con_accion"] * _MINUTOS_POR_PASO_ACCION,
+            unidades["bloques"] * _MINUTOS_POR_BLOQUE,
+        )
+        informe["minutos_por_paso"] = round(duracion / unidades["con_accion"], 2)
+        informe["minutos_por_bloque"] = round(duracion / unidades["bloques"], 2)
+    minimo = max(minimo_codigo, minimo_interfaz)
     # El tiempo que el trabajo necesita como mínimo y el que el hueco admite como
     # máximo (declarada × 4/3). La desviación es segura cuando incluso el mínimo
     # supera el techo: no hay forma de que el laboratorio quepa en su franja.
-    minimo = max(
-        unidades["con_accion"] * _MINUTOS_POR_PASO_ACCION,
-        unidades["bloques"] * _MINUTOS_POR_BLOQUE,
-    )
     techo = duracion * _TOLERANCIA_TECHO
     informe["duracion_minima"] = math.ceil(minimo)
     informe["duracion_maxima"] = math.floor(techo)
-    informe["ratio_minimo"] = round(minimo / duracion, 2)
+    informe["ratio_minimo"] = round(minimo / duracion, 2) if duracion else 0
     informe["presupuesto"] = presupuesto_de_duracion(duracion)
-    if minimo > techo:
+    lectura_excede = (
+        comparable_interfaz
+        and not comparable_codigo
+        and unidades.get("minutos_lectura", 0) > duracion
+    )
+    if minimo > techo or lectura_excede:
         informe["ok"] = False
+        detalle_gui = (
+            f", {unidades['prompts']} prompts, {unidades['pasos_gui']} pasos GUI, "
+            f"{unidades['validaciones']} validaciones, "
+            f"{unidades['minutos_lectura']} min de lectura"
+            if comparable_interfaz and not comparable_codigo
+            else ""
+        )
         informe["motivo"] = (
             f"{duracion} minutos declarados: el trabajo necesita al menos "
             f"{math.ceil(minimo)} y el hueco admite hasta {math.floor(techo)} "
-            f"({unidades['con_accion']} pasos con accion, {unidades['bloques']} bloques)"
+            f"({unidades['con_accion']} pasos con accion, {unidades['bloques']} bloques"
+            f"{detalle_gui})"
         )
     return informe
 
@@ -1589,6 +1720,9 @@ _OS_PLAN_RE = re.compile(
     r"\b(windows(?: server)?|macos|apple ios|ubuntu|debian|centos|rhel|"
     r"red hat enterprise linux|fedora|rocky|android|linux)\b"
 )
+_HERRAMIENTA_TEMARIO_RE = re.compile(
+    r"\b(PowerShell|pwsh|bash|zsh|Visual Studio Code|VS Code|Docker|kubectl)\b"
+)
 # Familias: pedir Ubuntu cuando el plan declara Linux no es contradecirlo, y
 # Windows Server es Windows. ``IOS`` a secas se deja fuera a propósito: en este
 # corpus casi siempre es el IOS de Cisco, no el de Apple.
@@ -1665,6 +1799,33 @@ def _es_ilustrativo(prosa: str, inicio: int, fin: int) -> bool:
         return True
     if normalizar(antes).rstrip().endswith("tool"):
         return True
+    return False
+
+
+def _alternativa_de_un_os_declarado(prosa: str, inicio: int, fin: int, familias_plan: set) -> bool:
+    """¿La línea ofrece el sistema del plan y este como alternativa?
+
+    «Windows 10/11 o macOS con navegador compatible» no contradice un plan que
+    declara Windows: amplía las opciones del alumno (MS-4018, QA del 25/11/2026).
+    Solo cuenta si el sistema declarado está en la misma línea y unido por «o»,
+    «u», «or», «y», «/» o una coma.
+    """
+    if not familias_plan:
+        return False
+    ini_linea = prosa.rfind("\n", 0, inicio) + 1
+    fin_linea = prosa.find("\n", fin)
+    if fin_linea < 0:
+        fin_linea = len(prosa)
+    for otro in _OS_RE.finditer(prosa, ini_linea, fin_linea):
+        if otro.start() == inicio:
+            continue
+        familia = _FAMILIA_OS.get(normalizar(otro.group(1)), normalizar(otro.group(1)))
+        if familia not in familias_plan:
+            continue
+        a, b = sorted(((otro.start(), otro.end()), (inicio, fin)))
+        entre = prosa[a[1]:b[0]]
+        if len(entre) <= 30 and re.search(r"(?i)(?:^|\W)(?:o|u|or|y|and)(?:\W|$)|[/,]", entre):
+            return True
     return False
 
 
@@ -1765,7 +1926,11 @@ def _versiones_declaradas(declarado: str, herramienta: str) -> list[str]:
     ]
 
 
-def auditar_requisitos(laboratorio_md: str, requisitos_texto: str) -> dict:
+def auditar_requisitos(
+    laboratorio_md: str,
+    requisitos_texto: str,
+    temario: str | None = None,
+) -> dict:
     """B5: ¿el laboratorio exige algo que el plan no declara?
 
     Se separan dos cosas que no valen lo mismo:
@@ -1780,8 +1945,9 @@ def auditar_requisitos(laboratorio_md: str, requisitos_texto: str) -> dict:
     59 laboratorios (4,6 %) con ampliaciones, todas de hardware.
     """
     declarado = requisitos_texto or ""
+    usar_temario = temario is not None and os.environ.get("B5_SYLLABUS", "1") != "0"
     informe = {"ok": True, "contradicciones": [], "ampliaciones": []}
-    if not declarado.strip():
+    if not declarado.strip() and not usar_temario:
         return informe
 
     prosa_original = _PROSA_RE.sub(lambda m: " " * len(m.group(0)), laboratorio_md or "")
@@ -1789,6 +1955,12 @@ def auditar_requisitos(laboratorio_md: str, requisitos_texto: str) -> dict:
         _FAMILIA_OS.get(normalizar(m.group(1)), normalizar(m.group(1)))
         for m in _OS_PLAN_RE.finditer(declarado)
     }
+    familias_temario = set()
+    if usar_temario:
+        familias_temario = {
+            _FAMILIA_OS.get(normalizar(m.group(1)), normalizar(m.group(1)))
+            for m in _OS_RE.finditer(temario or "")
+        }
     magnitudes_plan = _magnitudes(declarado)
 
     def contexto(inicio: int, fin: int) -> str:
@@ -1802,7 +1974,28 @@ def auditar_requisitos(laboratorio_md: str, requisitos_texto: str) -> dict:
         if _es_ilustrativo(prosa_original, m.start(), m.end()):
             continue
         familia = _FAMILIA_OS.get(normalizar(m.group(1)), normalizar(m.group(1)))
+        if usar_temario and familia not in familias_temario:
+            if not _alternativa_de_un_os_declarado(
+                prosa_original, m.start(), m.end(), familias_temario
+            ):
+                if familias_temario:
+                    informe["contradicciones"].append(
+                        {
+                            "tipo": "os_temario",
+                            "valor": m.group(1),
+                            "declarado": sorted(familias_temario),
+                        }
+                    )
+                else:
+                    informe["ampliaciones"].append(
+                        {"tipo": "os_temario", "valor": m.group(1)}
+                    )
+                continue
+        if not declarado.strip():
+            continue
         if familia in familias_plan:
+            continue
+        if _alternativa_de_un_os_declarado(prosa_original, m.start(), m.end(), familias_plan):
             continue
         if familias_plan:
             informe["contradicciones"].append(
@@ -1810,6 +2003,24 @@ def auditar_requisitos(laboratorio_md: str, requisitos_texto: str) -> dict:
             )
         else:
             informe["ampliaciones"].append({"tipo": "os", "valor": m.group(1)})
+
+    if usar_temario:
+        temario_norm = normalizar(temario or "")
+        for m in _HERRAMIENTA_TEMARIO_RE.finditer(prosa_original):
+            ctx = contexto(m.start(), m.end())
+            if not any(p in ctx for p in _PRESCRIPTIVO) or any(x in ctx for x in _EXCLUYENTE):
+                continue
+            if _es_ilustrativo(prosa_original, m.start(), m.end()):
+                continue
+            if normalizar(m.group(1)) in temario_norm:
+                continue
+            informe["ampliaciones"].append(
+                {"tipo": "herramienta_temario", "valor": m.group(1)}
+            )
+
+    if not declarado.strip():
+        informe["ok"] = not informe["contradicciones"] and not informe["ampliaciones"]
+        return informe
 
     for m in _VERSION_RE.finditer(prosa_original):
         ctx = contexto(m.start(), m.end())
@@ -1878,6 +2089,7 @@ def auditar_laboratorio(
     requisitos_texto=None,
     expected_outcomes=None,
     entorno: dict | None = None,
+    temario: str | None = None,
 ) -> dict:
     """B1/B2/B3/B6: cierre de referentes y de duración.
 
@@ -1908,6 +2120,8 @@ def auditar_laboratorio(
             con :func:`requisitos_declarados`.
         expected_outcomes: salidas esperadas del laboratorio según el plan. Si se
             pasan, se comprueba B3p.
+        temario: texto del temario solo. Si es ``None`` se usan ``fuentes``.
+            Las entidades bloqueadas se leen de aquí, no del manual.
 
     Returns:
         ``{"total", "creados", "marcados", "violaciones", "menciones_posteriores",
@@ -2038,7 +2252,11 @@ def auditar_laboratorio(
 
     # B5: requisitos técnicos que el laboratorio exige y el plan no declara. La
     # contradicción es de alta confianza; la ampliación se registra con baja.
-    requisitos = auditar_requisitos(laboratorio_md or "", requisitos_texto or "")
+    requisitos = auditar_requisitos(
+        laboratorio_md or "",
+        requisitos_texto or "",
+        temario=temario if temario is not None else None,
+    )
     for hallazgo in requisitos["contradicciones"]:
         violaciones.append(
             {
@@ -2112,6 +2330,14 @@ def auditar_laboratorio(
             }
         )
 
+    # A2e: nombres, lugares, entregables y prohibiciones que el temario declara.
+    # Solo alta confianza. Una frase capitalizada sin rol declarado no es hallazgo.
+    for hallazgo in auditar_anclajes(
+        fuentes if temario is None else temario,
+        laboratorio_md or "",
+    ):
+        violaciones.append(hallazgo)
+
     # Forma débil de B2: menciones explícitas a un laboratorio posterior. No son
     # violaciones (una hoja de ruta es normal): van en su propia clave del informe.
     menciones_posteriores = list(referencias_posteriores or ())
@@ -2164,6 +2390,15 @@ def mensaje_de_correccion(violaciones: list[dict], ambito: str) -> str:
                 "- no cambies el escenario, los nombres ni las cifras que el temario fija."
             )
             partes.append(intro + "\n" + "\n".join(lineas))
+        a2e_plan = [v for v in violaciones if v.get("verificacion") == "A2e"]
+        if a2e_plan:
+            lineas = [f"- {v['valor']}" for v in a2e_plan[:20]]
+            partes.append(
+                "El plan cambia entidades, lugares o entregables que el temario fija, "
+                "o incluye algo que el temario prohíbe. Restaura el texto del temario "
+                "y no sustituyas un nombre por otro:\n"
+                + "\n".join(lineas)
+            )
         return "\n\n".join(partes)
 
     bloques: list[str] = []
@@ -2282,6 +2517,20 @@ def mensaje_de_correccion(violaciones: list[dict], ambito: str) -> str:
         )
         bloques.append(intro + "\n" + "\n".join(lineas))
 
+    a2e = [v for v in violaciones if v.get("verificacion") == "A2e"]
+    if a2e:
+        lineas = [f"- {v['valor']}" for v in a2e[:20]]
+        bloques.append(
+            "La guía no respeta entidades, lugares, entregables o prohibiciones que el "
+            "temario fija. El temario es la fuente de verdad:\n"
+            "- restaura el nombre, la organización, el lugar y el entregable tal como "
+            "los declara el temario, aunque el plan haya usado otro;\n"
+            "- no sustituyas esa entidad por otra empresa, otro país u otro entregable;\n"
+            "- no incluyas ni recomiendes lo que el temario prohíbe.\n"
+            "No borres pasos ni entregables que el temario sí pide.\n"
+            + "\n".join(lineas)
+        )
+
     return "\n\n".join(bloques)
 
 
@@ -2297,7 +2546,11 @@ def mensaje_de_correccion(violaciones: list[dict], ambito: str) -> str:
 _MINUTOS_POR_LAB_PREFLIGHT = 12
 
 
-def preflight_duracion(curso: dict, laboratorios: list[dict]) -> dict:
+def preflight_duracion(
+    curso: dict,
+    laboratorios: list[dict],
+    minutos_plan: dict | None = None,
+) -> dict:
     """¿El temario puede sostener los laboratorios que declara?
 
     Se ejecuta **antes** de generar las guías: no hay pasos ni bloques, solo la
@@ -2312,6 +2565,11 @@ def preflight_duracion(curso: dict, laboratorios: list[dict]) -> dict:
       ``_MINUTOS_POR_LAB_PREFLIGHT``.
 
     Devuelve ``{"modulos": [...], "avisos": n, "modulos_con_aviso": k}``. No bloquea.
+
+    ``minutos_plan`` maps a module prefix (``"01"``) to the minutes of the plan
+    that will actually be saved. After the format budget scales or merges labs,
+    the overcommit check uses those minutes. The syllabus activity sum stays in
+    ``pedido_temario`` and is not, by itself, a warning.
     """
     modulos = (curso or {}).get("modules") or []
     conteo: dict[str, int] = {}
@@ -2344,11 +2602,16 @@ def preflight_duracion(curso: dict, laboratorios: list[dict]) -> dict:
         actividades = modulo.get("lab_activities") or []
         # Solo cuenta lo que el temario **declara**: sumar 30 por defecto a las
         # actividades sin duración fabricaría un sobre-compromiso que no está escrito.
-        pedido = sum(
+        pedido_temario = sum(
             a.get("duration_minutes")
             for a in actividades
             if isinstance(a, dict) and a.get("duration_minutes")
         )
+        prefijo_modulo = f"{indice:02d}"
+        if minutos_plan is not None and prefijo_modulo in minutos_plan:
+            pedido = minutos_plan[prefijo_modulo]
+        else:
+            pedido = pedido_temario
         senales = []
         if pedido and pedido > presupuesto:
             senales.append("sobre_comprometido")
@@ -2363,6 +2626,7 @@ def preflight_duracion(curso: dict, laboratorios: list[dict]) -> dict:
                 "laboratorios": laboratorios_del_modulo,
                 "presupuesto_practica": round(presupuesto, 1),
                 "pedido_actividades": round(pedido, 1),
+                "pedido_temario": round(pedido_temario, 1),
                 "por_laboratorio": round(por_laboratorio, 1),
                 "senales": senales,
             }
@@ -2420,10 +2684,14 @@ _CANTIDADES_ESTRUCTURALES = frozenset(
 # Una cantidad dentro de una **instrucción** no describe el escenario: «documenta
 # 3 escenarios» o «anticipa al menos 10 escenarios» no contradicen «2 escenarios»
 # del temario. Solo se comparan cantidades en prosa descriptiva.
+# ``revis\w*`` and ``compar\w*`` used to match nouns/adjectives (*revisión*, *comparativo*)
+# and silently drop scenario quantities (MS-4019: «seis fondos»). Keep verb forms only.
 _INSTRUCCION_RE = re.compile(
     r"\b(?:document\w*|anticip\w*|identific\w*|seleccion\w*|mencion\w*|analic\w*|"
-    r"inclu\w*|agreg\w*|complet\w*|defin\w*|prepar\w*|elabor\w*|redact\w*|revis\w*|"
-    r"ejecut\w*|compar\w*|justific\w*|enumer\w*|list\w*|explic\w*|describ\w*|"
+    r"inclu\w*|agreg\w*|complet\w*|defin\w*|prepar\w*|elabor\w*|redact\w*|"
+    r"revis(?:ar|a|e|en|ad|ando|ado)\b|"
+    r"ejecut\w*|compar(?:ar|a|e|en|ad|ando|ado)\b|"
+    r"justific\w*|enumer\w*|list\w*|explic\w*|describ\w*|"
     r"solicit\w*|crea\w*|escrib\w*|respond\w*|agrega\w*|anad\w*|añad\w*)\b"
     r"|al menos|como minimo|como mínimo|minimo|mínimo|maximo|máximo|hasta"
 )
@@ -2836,3 +3104,773 @@ def auditar_contrato(master_plan: dict, labs) -> dict:
         "conflictos": conflictos,
         "ok": not conflictos,
     }
+
+
+# --------------------------------------------------------------------------- #
+# A2e: lock the names, places, deliverables and prohibitions the syllabus
+# actually states. A capitalised phrase with no declared role is not a finding:
+# that rule marked every guide (14,670 strings). High confidence only.
+# --------------------------------------------------------------------------- #
+
+# Tools and headings that dominated the rejected extractor. A quoted product is
+# not a scenario entity. Deliverables named by an explicit label are exempt:
+# the label is the declaration, not the capitalisation.
+_PRODUCTOS = frozenset({
+    "microsoft", "edge", "copilot", "studio", "intel", "core", "windows",
+    "office", "excel", "word", "powerpoint", "teams", "sharepoint", "outlook",
+    "azure", "aws", "google", "python", "docker", "git", "github", "linux",
+    "ubuntu", "macos", "chatgpt", "power", "bi", "visual", "vscode", "onedrive",
+    "planner", "designer", "loop", "forms", "stream", "viva", "linkedin", "sql",
+    "server", "node", "java", "javascript", "typescript", "react", "angular",
+    "vue", "kubernetes", "terraform", "ansible", "jenkins", "gitlab", "bitbucket",
+    "jira", "confluence", "slack", "zoom", "sap", "oracle", "salesforce", "adobe",
+    "photoshop", "figma", "canva", "notion", "bloomberg", "chrome", "firefox",
+    "safari", "android", "ios", "npm", "pip", "pandas", "numpy", "spark", "kafka",
+    "redis", "postgres", "postgresql", "mysql", "mongodb", "nginx", "apache",
+    "api", "url", "http", "https", "json", "yaml", "csv", "html", "css", "gui",
+    "cli", "cpu", "ram", "iso", "nat", "sku", "ide", "pdf", "xml",
+})
+_NO_ENTIDAD = frozenset({
+    "salida esperada", "nivel bloom", "expected output", "learning objectives",
+    "objetivos de aprendizaje", "descripcion general", "paso a paso",
+    "instrucciones paso a paso", "validacion y pruebas", "solucion de problemas",
+    "bloom level", "expected outputs",
+})
+_CONECTORES_NOMBRE = frozenset({
+    "de", "del", "la", "las", "los", "el", "y", "e", "of", "the", "and", "da", "do",
+})
+_ENTREGABLE_GENERICO = frozenset({
+    "informe", "documento", "archivo", "fichero", "reporte", "presentacion",
+    "tabla", "lista", "resumen", "entregable", "ejercicio", "practica",
+    "laboratorio", "resultado", "evidencia", "captura", "diagrama", "final",
+    "documento", "archivo",
+})
+_PROHIBICION_GENERICA = frozenset({
+    "nada", "cosas", "esto", "eso", "algo", "contenido", "texto", "textos",
+    "informacion", "datos", "elementos", "puntos", "temas", "aspectos",
+    "detalles", "informaciones", "ejemplo", "ejemplos",
+})
+_STOP_PROHIBICION = _CONECTORES_NOMBRE | frozenset({
+    "un", "una", "unos", "unas", "que", "para", "por", "con", "sin", "como",
+    "sus", "su", "este", "esta", "ese", "esa", "en", "al", "lo", "se", "no", "ni",
+    "ya", "mas", "muy", "todo", "toda", "todos", "todas", "curso", "laboratorio",
+    "practica", "estudiante", "alumnos", "alumno", "debe", "deben", "incluir",
+    "incluya", "usar", "utilizar",
+})
+# Countries and regions a scenario is moved to. Used to recognise a place the
+# syllabus named, and to see Spain / EU when that place was replaced. Not a
+# scan of every capitalised word.
+_LUGARES = (
+    "El Salvador", "Costa Rica", "Puerto Rico", "República Dominicana",
+    "Republica Dominicana", "Estados Unidos", "United States", "Reino Unido",
+    "United Kingdom", "Unión Europea", "Union Europea", "European Union",
+    "España", "Spain", "México", "Mexico", "Guatemala", "Honduras", "Nicaragua",
+    "Panamá", "Panama", "Colombia", "Venezuela", "Ecuador", "Perú", "Peru",
+    "Bolivia", "Chile", "Argentina", "Uruguay", "Paraguay", "Brasil", "Brazil",
+    "Cuba", "Canadá", "Canada", "Francia", "France", "Alemania", "Germany",
+    "Italia", "Italy", "Portugal", "China", "Japón", "Japan", "India", "Australia",
+)
+_LUGARES_NORM = frozenset(normalizar(lugar) for lugar in _LUGARES)
+_LUGAR_ALT = "|".join(re.escape(lugar) for lugar in sorted(_LUGARES, key=len, reverse=True))
+_MAX_ENTIDADES = 12
+_MAX_PROHIBICIONES = 8
+_PRIORIDAD_ROL = {"entidad": 1, "entregable": 2, "organizacion": 3, "lugar": 4}
+
+_ANCLAJE_RE = re.compile(
+    r"(?im)^[ \t]*[-*]?\s*(?:\*\*|__)?(?:(?:el|la|los|las)\s+)?"
+    r"(?<![\w])(?P<etiq>producto\s+final|entregables?(?:\s+\w+){0,2}|"
+    r"deliverables?|empresa|compa[nñ][ií]a|organizaci[oó]n|cliente|firma|banco|"
+    r"company|organization|client|pa[ií]s|lugar|sede|regi[oó]n|jurisdicci[oó]n|"
+    r"country|place|escenario|caso|scenario|case)"
+    r"\s*(?:\*\*|__)?\s*[:：]\s*(?P<valor>\S.*?)\s*$"
+)
+_INTRO_RE = re.compile(
+    r"(?i)\b(?P<intro>en el contexto de|para la empresa|para el cliente|"
+    r"la empresa|el cliente|la compa[nñ][ií]a|la organizaci[oó]n|la firma|"
+    r"el banco|en el caso de|el caso de|en el pa[ií]s|del pa[ií]s|el pa[ií]s|"
+    r"pa[ií]s de)\s+"
+)
+_NOMBRE_SEGUIDO_RE = re.compile(
+    r"(?P<nombre>[A-ZÁÉÍÓÚÜÑ0-9][\wÁÉÍÓÚÜÑáéíóúüñ&'-]*"
+    r"(?:\s+(?:de|del|la|las|los|y|e|of|the|and|da|do|"
+    r"[A-ZÁÉÍÓÚÜÑ0-9][\wÁÉÍÓÚÜÑáéíóúüñ&'-]*)){0,5})"
+)
+_LUGAR_ESTRICTO_RE = re.compile(
+    r"\b(?:se\s+sit[uú]a|situad[oa]s?|ubicad[oa]s?|con\s+sede|sede)\s+en\s+"
+    r"(?:(?:la|el)\s+)?(?P<lugar>" + _LUGAR_ALT + r")\b"
+    r"|\b(?:escenario|caso|scenario|case)\b[^.\n]{0,60}?\ben\s+"
+    r"(?:(?:la|el)\s+)?(?P<lugar2>" + _LUGAR_ALT + r")\b",
+    re.IGNORECASE,
+)
+_LUGAR_EN_LAB_RE = re.compile(
+    r"(?:\ben\s+(?:la\s+|el\s+)?|\b(?:sede|pa[ií]s)\s+(?:en\s+)?)"
+    r"(?P<lugar>" + _LUGAR_ALT + r")"
+    r"(?:\s*/\s*(?P<ue_tras>EU|UE))?"
+    r"\b"
+    r"|(?P<corto>Spain|España)\s*/\s*(?P<ue>EU|UE)\b"
+    r"|(?:\ben\s+la\s+)(?P<ue2>UE|EU)\b",
+    re.IGNORECASE,
+)
+_MAYUSCULAS_RE = re.compile(
+    r"\b([A-ZÁÉÍÓÚÜÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÜÑ]{2,}){1,4})\b"
+)
+_TITULO_RE = re.compile(
+    r"\b([A-ZÁÉÍÓÚÜÑ][\wÁÉÍÓÚÜÑáéíóúüñ&'-]*"
+    r"(?:\s+(?:de|del|la|las|los|y|e|of|the|and|"
+    r"[A-ZÁÉÍÓÚÜÑ][\wÁÉÍÓÚÜÑáéíóúüñ&'-]*)){1,5})\b"
+)
+_PARENTESIS_MAYUS_RE = re.compile(
+    r"[\(（]([A-ZÁÉÍÓÚÜÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÜÑ]{2,}){1,4})[\)）]"
+)
+_COMILLAS_RE = re.compile(
+    r"«([^»\n]{2,80})»|“([^”\n]{2,80})”|\"([^\"\n]{2,80})\""
+)
+_PROHIBICION_RE = re.compile(
+    r"(?i)\bno\s+(?:se\s+)?(?:debe(?:n|rá|rán)?|deber[ií]a[n]?)\s+"
+    r"(?:(?:incluir|incluya[ns]?|recomend\w*|usar|utilizar|mencionar|proponer|"
+    r"sugerir|dar|hacer|contener|inventar|añadir|anadir|agregar)\s+)?"
+    r"(?P<a>[^.\n;]{4,140})"
+    r"|\bno\s+incluir\s+(?P<b>[^.\n;]{4,140})"
+    r"|\bno\s+incluya(?:n|s)?\s+(?P<c>[^.\n;]{4,140})"
+    r"|\bno\s+recomend\w*\s+(?P<d>[^.\n;]{4,140})"
+)
+_NOMBRE_COMA_ROL_RE = re.compile(
+    r"(?P<nombre>[A-ZÁÉÍÓÚÜÑ][\wÁÉÍÓÚÜÑáéíóúüñ&'-]*"
+    r"(?:\s+[A-ZÁÉÍÓÚÜÑ][\wÁÉÍÓÚÜÑáéíóúüñ&'-]*){0,4})"
+    r",\s+una\s+(?:empresa|firma|compa[nñ][ií]a|organizaci[oó]n|consultora|"
+    r"instituci[oó]n)\b"
+)
+_ROL_ES = {
+    "organizacion": "Organización (exacta)",
+    "lugar": "Lugar (exacto)",
+    "entidad": "Entidad del escenario (exacta)",
+    "entregable": "Entregable obligatorio",
+    "producto": "Producto nombrado en el temario",
+}
+_ROL_EN = {
+    "organizacion": "Organization (exact)",
+    "lugar": "Place (exact)",
+    "entidad": "Scenario entity (exact)",
+    "entregable": "Required deliverable",
+    "producto": "Product named in the syllabus",
+}
+_ARRANQUE_COMUN = frozenset({
+    "use", "using", "usa", "usar", "abra", "abrir", "open", "el", "la", "los",
+    "las", "the", "this", "para", "con", "en", "de", "curso", "modulo", "module",
+    "leccion", "lesson", "chapter", "capitulo", "lab", "practica", "practice",
+    "demo", "seccion", "section", "tema", "topic", "actividad", "activity",
+    "introduccion", "introduction", "resumen", "summary", "objetivo", "objective",
+})
+_PALABRA_COMUN = _ARRANQUE_COMUN | frozenset({
+    "general", "esperado", "esperada", "salida", "nivel", "bloom", "interno",
+    "interna", "revision", "comparativo", "ejemplo", "formato", "fecha", "curso",
+    "alumno", "estudiante", "instructor", "guia", "laboratorio", "paso", "pasos",
+})
+
+
+def _sin_adornos(texto: str) -> str:
+    texto = " ".join((texto or "").split()).strip("*_`")
+    if len(texto) >= 2 and texto[0] == texto[-1] and texto[0] in "\"'":
+        texto = texto[1:-1].strip()
+    if len(texto) >= 2 and texto[0] in "«“" and texto[-1] in "»”":
+        texto = texto[1:-1].strip()
+    return texto.strip(" \t.:;")
+
+
+def _recortar_nombre(nombre: str) -> str:
+    """Drop a trailing lowercase connector captured with the proper name."""
+    tokens = _sin_adornos(nombre).split()
+    while tokens and tokens[-1].islower() and normalizar(tokens[-1]) in _CONECTORES_NOMBRE:
+        tokens.pop()
+    while len(tokens) > 1 and tokens[0].islower() and normalizar(tokens[0]) in _CONECTORES_NOMBRE:
+        tokens.pop(0)
+    return " ".join(tokens)
+
+
+def _es_producto(tokens: list[str]) -> bool:
+    significativos = [
+        normalizar(token)
+        for token in tokens
+        if normalizar(token) not in _CONECTORES_NOMBRE and not token.isdigit()
+    ]
+    if not significativos:
+        return False
+    return all(token in _PRODUCTOS or token.isdigit() for token in significativos)
+
+
+def _lema_ligero(token: str) -> str:
+    lema = normalizar(token)
+    if len(lema) > 5 and lema.endswith("es"):
+        return lema[:-2]
+    if len(lema) > 4 and lema.endswith("s"):
+        return lema[:-1]
+    return lema
+
+
+def _rol_de_etiqueta(etiqueta: str) -> str:
+    nombre = normalizar(etiqueta)
+    if nombre.startswith(("entregable", "deliverable", "producto")):
+        return "entregable"
+    if nombre.startswith((
+        "pais", "lugar", "sede", "region", "jurisdiccion", "country", "place",
+    )):
+        return "lugar"
+    if nombre.startswith(("escenario", "caso", "scenario", "case")):
+        return "escenario"
+    return "organizacion"
+
+
+def _rol_de_intro(intro: str) -> str:
+    nombre = normalizar(intro)
+    if "pais" in nombre:
+        return "lugar"
+    if "caso" in nombre:
+        return "entidad"
+    return "organizacion"
+
+
+def _nombre_valido(nombre: str, rol: str, una_palabra_estricta: bool) -> bool:
+    nombre = _recortar_nombre(nombre)
+    if not nombre or len(nombre) > 80 or len(nombre) < 2:
+        return False
+    if _FICHERO_RE.search(nombre):
+        return False
+    if normalizar(nombre) in _NO_ENTIDAD:
+        return False
+    tokens = nombre.split()
+    if len(tokens) > 6:
+        return False
+    if any(
+        token[:1].islower() and normalizar(token) not in _CONECTORES_NOMBRE
+        for token in tokens
+    ):
+        if rol != "entregable":
+            return False
+    if rol == "entregable":
+        palabras = [
+            token for token in tokens if normalizar(token) not in _CONECTORES_NOMBRE
+        ]
+        if len(palabras) < 2 or len(palabras) > 6:
+            return False
+        if all(normalizar(token) in _ENTREGABLE_GENERICO for token in palabras):
+            return False
+        return True
+    if any(not token[:1].isalpha() for token in tokens):
+        return False
+    significativos = [
+        token for token in tokens if normalizar(token) not in _CONECTORES_NOMBRE
+    ]
+    if not significativos:
+        return False
+    if _es_producto(significativos):
+        return False
+    if len(significativos) == 1:
+        token = significativos[0]
+        if normalizar(token) in _LUGARES_NORM or normalizar(nombre) in _LUGARES_NORM:
+            return True
+        if una_palabra_estricta:
+            return token.isupper() and len(token) >= 4
+        if normalizar(token) in _PROHIBICION_GENERICA or len(token) < 3:
+            return False
+        return token[:1].isupper()
+    return True
+
+
+def _añadir_entidad(bolsa: dict, nombre: str, rol: str, inicio: int, estricta: bool) -> None:
+    nombre = _recortar_nombre(nombre)
+    if not _nombre_valido(nombre, rol, estricta):
+        return
+    clave = normalizar(nombre)
+    if clave in _LUGARES_NORM and rol in ("entidad", "organizacion"):
+        rol = "lugar"
+    previo = bolsa["index"].get(clave)
+    if previo is None:
+        if len(bolsa["entidades"]) >= _MAX_ENTIDADES:
+            return
+        item = {"nombre": nombre, "rol": rol, "inicio": inicio}
+        bolsa["entidades"].append(item)
+        bolsa["index"][clave] = item
+        return
+    if _PRIORIDAD_ROL[rol] > _PRIORIDAD_ROL[previo["rol"]]:
+        previo["rol"] = rol
+
+
+def _nombre_inicial(valor: str) -> str:
+    limpio = _sin_adornos(valor)
+    if "," in limpio:
+        izquierda = limpio.split(",", 1)[0]
+        if _nombre_valido(izquierda, "entidad", una_palabra_estricta=False):
+            return _recortar_nombre(izquierda)
+    tokens: list[str] = []
+    for token in re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9&'-]+", limpio):
+        if token[:1].islower() and normalizar(token) not in _CONECTORES_NOMBRE:
+            break
+        tokens.append(token)
+        if len(tokens) >= 6:
+            break
+    return _recortar_nombre(" ".join(tokens))
+
+
+def _escanear_seccion(valor: str, inicio: int, bolsa: dict) -> None:
+    """Proper names inside a scenario/case value, not the whole sentence."""
+    for match in _MAYUSCULAS_RE.finditer(valor or ""):
+        _añadir_entidad(bolsa, match.group(1), "organizacion", inicio + match.start(), True)
+    for match in _TITULO_RE.finditer(valor or ""):
+        _añadir_entidad(bolsa, match.group(1), "entidad", inicio + match.start(), True)
+    for match in _LUGAR_ESTRICTO_RE.finditer(valor or ""):
+        lugar = match.group("lugar") or match.group("lugar2")
+        if lugar:
+            _añadir_entidad(bolsa, lugar, "lugar", inicio + match.start(), False)
+
+
+def _partir_entregables(valor: str) -> list[str]:
+    piezas = re.split(r"\s*(?:;|,|\sy\s|\se\s)\s*", _sin_adornos(valor))
+    return [pieza for pieza in (_sin_adornos(pieza) for pieza in piezas) if pieza]
+
+
+def _absorber_etiqueta(etiqueta: str, valor: str, inicio: int, bolsa: dict) -> None:
+    rol = _rol_de_etiqueta(etiqueta)
+    if rol == "entregable":
+        for pieza in _partir_entregables(valor):
+            _añadir_entidad(bolsa, pieza, "entregable", inicio, True)
+        return
+    if rol == "escenario":
+        _escanear_seccion(valor, inicio, bolsa)
+        return
+    nombre = _nombre_inicial(valor)
+    if nombre:
+        _añadir_entidad(bolsa, nombre, rol, inicio, False)
+
+
+def _en_frase_prohibitiva(texto: str, posicion: int) -> bool:
+    ventana = normalizar(texto[max(0, posicion - 50):posicion])
+    return bool(re.search(r"\b(?:no debe|no incluir|no incluya|prohib)\w*", ventana))
+
+
+def _objetos_de_prohibicion(bruto: str) -> list[str]:
+    objetos = []
+    for parte in re.split(r"\s+ni\s+", _sin_adornos(bruto or "")):
+        parte = re.sub(
+            r"(?i)^(el|la|los|las|un|una|unos|unas|de|del)\s+", "", parte
+        ).strip(" \t.:;")
+        if parte:
+            objetos.append(parte)
+    return objetos
+
+
+def _tokens_de_prohibicion(objeto: str) -> list[str]:
+    tokens = []
+    for token in re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]+", objeto or ""):
+        lema = _lema_ligero(token)
+        if len(lema) < 5 or lema in _STOP_PROHIBICION or lema in _PROHIBICION_GENERICA:
+            continue
+        tokens.append(lema)
+    if not tokens:
+        return []
+    if len(tokens) == 1 and len(tokens[0]) < 6:
+        return []
+    return tokens
+
+
+def _palabras_norm(texto_norm: str):
+    for match in re.finditer(r"[a-z0-9]+", texto_norm or ""):
+        yield _lema_ligero(match.group(0)), match.start(), match.end()
+
+
+def _afirma_prohibicion(prosa: str, objeto: str) -> bool:
+    necesarios = set(_tokens_de_prohibicion(objeto))
+    if not necesarios:
+        return False
+    prosa_norm = normalizar(prosa)
+    palabras = list(_palabras_norm(prosa_norm))
+    for indice, (lema, inicio, _fin) in enumerate(palabras):
+        if lema not in necesarios:
+            continue
+        ventana = []
+        for otra in palabras[indice:indice + 12]:
+            if otra[1] - inicio > 100:
+                break
+            ventana.append(otra)
+        presentes = {item[0] for item in ventana}
+        if not necesarios.issubset(presentes):
+            continue
+        primero = min(item[1] for item in ventana if item[0] in necesarios)
+        ultimo = max(item[2] for item in ventana if item[0] in necesarios)
+        alrededor = prosa_norm[max(0, primero - 40):ultimo + 20]
+        if re.search(r"\b(?:no|sin|nunca|prohib\w*|evit\w*)\b", alrededor):
+            continue
+        return True
+    return False
+
+
+def extraer_anclajes(temario: str) -> dict:
+    """Declared scenario anchors and explicit prohibitions from the syllabus.
+
+    Reads labels (empresa, país, escenario, entregable), introducers
+    (``en el contexto de``), quoted and parenthetical proper names, and
+    ``no debe`` / ``no incluir``. With ``A2E_UNLABELED`` (default on) it also
+    locks unlabeled multiword names, countries that are not date-format
+    examples, and product phrases. It still does not collect every capitalised
+    word.
+    """
+    bolsa = {"entidades": [], "index": {}, "prohibiciones": []}
+    texto = _texto_sin_bloques(temario or "")
+    if not texto.strip():
+        return {"entidades": [], "prohibiciones": []}
+
+    for match in _ANCLAJE_RE.finditer(texto):
+        _absorber_etiqueta(match.group("etiq"), match.group("valor"), match.start(), bolsa)
+
+    for match in _INTRO_RE.finditer(texto):
+        nombre = _NOMBRE_SEGUIDO_RE.match(texto, match.end())
+        if not nombre:
+            continue
+        _añadir_entidad(
+            bolsa,
+            nombre.group("nombre"),
+            _rol_de_intro(match.group("intro")),
+            match.start(),
+            False,
+        )
+
+    for match in _LUGAR_ESTRICTO_RE.finditer(texto):
+        lugar = match.group("lugar") or match.group("lugar2")
+        if lugar:
+            _añadir_entidad(bolsa, lugar, "lugar", match.start(), False)
+
+    for match in _PARENTESIS_MAYUS_RE.finditer(texto):
+        _añadir_entidad(bolsa, match.group(1), "organizacion", match.start(), True)
+
+    for match in _COMILLAS_RE.finditer(texto):
+        if _en_frase_prohibitiva(texto, match.start()):
+            continue
+        citado = next(grupo for grupo in match.groups() if grupo)
+        _añadir_entidad(bolsa, citado, "entidad", match.start(), True)
+
+    vistos: set[str] = set()
+    for match in _PROHIBICION_RE.finditer(texto):
+        bruto = next(grupo for grupo in match.groups() if grupo)
+        for objeto in _objetos_de_prohibicion(bruto):
+            if not _tokens_de_prohibicion(objeto):
+                continue
+            clave = normalizar(objeto)
+            if clave in vistos:
+                continue
+            if len(bolsa["prohibiciones"]) >= _MAX_PROHIBICIONES:
+                break
+            vistos.add(clave)
+            bolsa["prohibiciones"].append({"texto": objeto, "inicio": match.start()})
+
+    if os.environ.get("A2E_UNLABELED", "1") != "0":
+        _escanear_sin_etiqueta(texto, bolsa)
+
+    return {
+        "entidades": bolsa["entidades"],
+        "prohibiciones": bolsa["prohibiciones"],
+    }
+
+
+def _aparece(texto_norm: str, nombre: str) -> bool:
+    frase = normalizar(nombre)
+    if not frase:
+        return False
+    return re.search(r"(?<![a-z0-9])" + re.escape(frase) + r"(?![a-z0-9])", texto_norm) is not None
+
+
+def _sustitutos(prosa: str, entidad: dict) -> list[tuple[str, int]]:
+    """A different proper name filling the same role. Products do not count."""
+    rol = entidad["rol"]
+    propios: list[tuple[str, int]] = []
+    vistos: set[str] = set()
+
+    def guardar(nombre: str, inicio: int, rol_hallado: str) -> None:
+        nombre = _recortar_nombre(nombre)
+        if not nombre or normalizar(nombre) == normalizar(entidad["nombre"]):
+            return
+        if rol == "lugar" and rol_hallado != "lugar":
+            return
+        if rol != "lugar" and rol_hallado == "lugar":
+            return
+        if rol == "entregable" and rol_hallado != "entregable":
+            return
+        codigo_lugar = rol_hallado == "lugar" and normalizar(nombre) in {"ue", "eu", "usa"}
+        if not codigo_lugar and rol_hallado != "entregable" and _es_producto(nombre.split()):
+            return
+        if not codigo_lugar and not _nombre_valido(
+            nombre, rol_hallado, rol_hallado == "entregable"
+        ):
+            return
+        clave = normalizar(nombre)
+        if clave in vistos:
+            return
+        vistos.add(clave)
+        propios.append((nombre, inicio))
+
+    if rol == "lugar":
+        for match in _LUGAR_EN_LAB_RE.finditer(prosa):
+            if match.group("ue") or match.group("ue2"):
+                corto = match.group("corto")
+                if corto:
+                    guardar(corto, match.start(), "lugar")
+                guardar(match.group("ue") or match.group("ue2"), match.start(), "lugar")
+                continue
+            lugar = match.group("lugar")
+            if lugar:
+                guardar(lugar, match.start(), "lugar")
+            if match.group("ue_tras"):
+                guardar(match.group("ue_tras"), match.start(), "lugar")
+        return propios
+
+    if rol == "entregable":
+        for match in _ANCLAJE_RE.finditer(prosa):
+            if _rol_de_etiqueta(match.group("etiq")) != "entregable":
+                continue
+            for pieza in _partir_entregables(match.group("valor")):
+                guardar(pieza, match.start(), "entregable")
+        return propios
+
+    for match in _INTRO_RE.finditer(prosa):
+        nombre = _NOMBRE_SEGUIDO_RE.match(prosa, match.end())
+        if not nombre:
+            continue
+        guardar(nombre.group("nombre"), match.start(), _rol_de_intro(match.group("intro")))
+    for match in _NOMBRE_COMA_ROL_RE.finditer(prosa):
+        guardar(match.group("nombre"), match.start(), "organizacion")
+    for match in _ANCLAJE_RE.finditer(prosa):
+        rol_hallado = _rol_de_etiqueta(match.group("etiq"))
+        if rol_hallado in ("entregable", "lugar"):
+            continue
+        if rol_hallado == "escenario":
+            for candidato in _MAYUSCULAS_RE.finditer(match.group("valor")):
+                guardar(candidato.group(1), match.start(), "organizacion")
+            for candidato in _TITULO_RE.finditer(match.group("valor")):
+                guardar(candidato.group(1), match.start(), "entidad")
+            continue
+        nombre = _nombre_inicial(match.group("valor"))
+        if nombre:
+            guardar(nombre, match.start(), rol_hallado)
+    return propios
+
+
+def _hallazgo_anclaje(entidad: dict, detalle: str, obtenido: str, inicio: int) -> dict:
+    nombre = entidad["nombre"]
+    if detalle == "reemplazo":
+        valor = f"{nombre}: el temario lo fija y la guía lo sustituye por {obtenido}"
+    elif entidad["rol"] == "entregable":
+        valor = f"entregable del temario omitido: {nombre}"
+    else:
+        valor = f"{nombre}: el temario lo fija y la guía no lo menciona"
+    tipo = entidad["rol"] if entidad["rol"] in ("lugar", "entregable") else "entidad"
+    return {
+        "valor": valor,
+        "tipo": tipo,
+        "inicio": inicio,
+        "confianza": "alta",
+        "verificacion": "A2e",
+        "rol": entidad["rol"],
+        "esperado": nombre,
+        "obtenido": obtenido or "",
+        "detalle": detalle,
+    }
+
+
+def auditar_anclajes(temario: str, texto: str) -> list[dict]:
+    """High-confidence findings when a locked anchor is missing or replaced.
+
+    An anchor the syllabus did not declare produces nothing, even if the guide
+    is full of capitalised tool names, headings and example people.
+    """
+    anclajes = extraer_anclajes(temario or "")
+    if not anclajes["entidades"] and not anclajes["prohibiciones"]:
+        return []
+    prosa = _texto_sin_bloques(texto or "")
+    if sum(caracter.isalnum() for caracter in prosa) < 20:
+        return []
+    prosa_norm = normalizar(prosa)
+    hallazgos: list[dict] = []
+    for entidad in anclajes["entidades"]:
+        if _aparece(prosa_norm, entidad["nombre"]):
+            continue
+        sustitutos = _sustitutos(prosa, entidad)
+        if sustitutos:
+            obtenido = ", ".join(nombre for nombre, _inicio in sustitutos[:3])
+            hallazgos.append(
+                _hallazgo_anclaje(entidad, "reemplazo", obtenido, sustitutos[0][1])
+            )
+        else:
+            hallazgo = _hallazgo_anclaje(entidad, "omision", "", 0)
+            if entidad.get("rol") == "producto":
+                hallazgo["confianza"] = "baja"
+            hallazgos.append(hallazgo)
+    for prohibicion in anclajes["prohibiciones"]:
+        if not _afirma_prohibicion(prosa, prohibicion["texto"]):
+            continue
+        hallazgos.append(
+            {
+                "valor": (
+                    "prohibido por el temario y la guía lo incluye: "
+                    + prohibicion["texto"]
+                ),
+                "tipo": "prohibicion",
+                "inicio": 0,
+                "confianza": "alta",
+                "verificacion": "A2e",
+                "rol": "prohibicion",
+                "esperado": prohibicion["texto"],
+                "obtenido": prohibicion["texto"],
+                "detalle": "prohibicion",
+            }
+        )
+    return hallazgos
+
+
+def texto_de_anclajes(temario: str, en_espanol: bool = True) -> str:
+    """Prompt block listing the locked anchors. Empty when the syllabus states none."""
+    anclajes = extraer_anclajes(temario or "")
+    entidades = anclajes["entidades"]
+    prohibiciones = anclajes["prohibiciones"]
+    if not entidades and not prohibiciones:
+        return ""
+    if en_espanol:
+        lineas = [
+            "ENTIDADES BLOQUEADAS (EL TEMARIO MANDA; NO LAS CAMBIES):",
+            "Copia estos nombres tal cual. No los sustituyas por otra empresa, otro país, "
+            "otro lugar ni otro entregable, aunque el plan use un nombre distinto.",
+        ]
+        etiquetas = _ROL_ES
+        prohibido = "El temario prohíbe incluir o recomendar lo siguiente:"
+    else:
+        lineas = [
+            "LOCKED ENTITIES (THE SYLLABUS WINS; DO NOT RENAME THEM):",
+            "Copy these names exactly. Do not replace them with another company, country, "
+            "place or deliverable, even if the plan uses a different name.",
+        ]
+        etiquetas = _ROL_EN
+        prohibido = "The syllabus forbids including or recommending the following:"
+    for entidad in entidades:
+        lineas.append(f"- {etiquetas.get(entidad['rol'], entidad['rol'])}: {entidad['nombre']}")
+    if prohibiciones:
+        lineas.append(prohibido)
+        for prohibicion in prohibiciones:
+            lineas.append(f"- {prohibicion['texto']}")
+    return "\n".join(lineas) + "\n"
+
+
+def _ventana_de_ejemplo(texto: str, inicio: int) -> bool:
+    ventana = normalizar(texto[max(0, inicio - 48): inicio + 48])
+    return any(
+        marca in ventana
+        for marca in ("ejemplo", "formato de fecha", "date format", "for example", "por ejemplo")
+    )
+
+
+def _añadir_producto(bolsa: dict, nombre: str, inicio: int) -> None:
+    nombre = _recortar_nombre(nombre)
+    if not nombre or not _es_producto(nombre.split()):
+        return
+    clave = normalizar(nombre)
+    if not clave or clave in _NO_ENTIDAD or clave in bolsa["index"]:
+        return
+    if len(bolsa["entidades"]) >= _MAX_ENTIDADES:
+        return
+    item = {"nombre": nombre, "rol": "producto", "inicio": inicio}
+    bolsa["entidades"].append(item)
+    bolsa["index"][clave] = item
+
+
+def _titulo_util(nombre: str) -> str:
+    tokens = nombre.split()
+    while tokens and normalizar(tokens[0]) in _ARRANQUE_COMUN:
+        tokens = tokens[1:]
+    if len(tokens) < 2:
+        return ""
+    contenido = [token for token in tokens if normalizar(token) not in _CONECTORES_NOMBRE]
+    if not contenido or all(normalizar(token) in _PALABRA_COMUN for token in contenido):
+        return ""
+    return " ".join(tokens)
+
+
+def _escanear_sin_etiqueta(texto: str, bolsa: dict) -> None:
+    """Lock unlabeled syllabus names. Headings and example countries stay out."""
+    for linea in texto.splitlines():
+        if linea.lstrip().startswith("#"):
+            continue
+        for match in _MAYUSCULAS_RE.finditer(linea):
+            _añadir_entidad(bolsa, match.group(1), "organizacion", match.start(), True)
+        for match in _TITULO_RE.finditer(linea):
+            frase = _titulo_util(match.group(1))
+            if not frase:
+                continue
+            if _es_producto(frase.split()):
+                for trozo in re.split(r"\s+(?:y|e|and)\s+", frase):
+                    _añadir_producto(bolsa, trozo.strip(), match.start())
+            else:
+                _añadir_entidad(bolsa, frase, "entidad", match.start(), True)
+    for lugar in _LUGARES:
+        for match in re.finditer(r"\b" + re.escape(lugar) + r"\b", texto):
+            if _ventana_de_ejemplo(texto, match.start()):
+                continue
+            _añadir_entidad(bolsa, lugar, "lugar", match.start(), False)
+
+
+def reparar_anclajes_en_guia(markdown: str, temario: str, en_espanol: bool = True) -> str:
+    """One deterministic pass: put the syllabus name back, or name the omission.
+
+    ``A2E_REPAIR=0`` leaves the guide untouched. Leftover findings stay warnings.
+    """
+    if os.environ.get("A2E_REPAIR", "1") == "0":
+        return markdown or ""
+    texto = markdown or ""
+    for hallazgo in auditar_anclajes(temario or "", texto):
+        if hallazgo.get("confianza") != "alta":
+            continue
+        esperado = str(hallazgo.get("esperado") or "").strip()
+        if not esperado:
+            continue
+        if hallazgo.get("detalle") == "reemplazo":
+            obtenido = str(hallazgo.get("obtenido") or "").split(",")[0].strip()
+            if obtenido and obtenido in texto:
+                texto = texto.replace(obtenido, esperado, 1)
+            continue
+        if hallazgo.get("detalle") == "omision" and esperado not in texto:
+            if en_espanol:
+                nota = (
+                    f"\n\nEl temario fija este nombre: {esperado}. "
+                    f"/ The syllabus fixes this name: {esperado}.\n"
+                )
+            else:
+                nota = (
+                    f"\n\nThe syllabus fixes this name: {esperado}. "
+                    f"/ El temario fija este nombre: {esperado}.\n"
+                )
+            texto = texto.rstrip() + nota
+    return texto
+
+
+def reparar_requisitos_contra_temario(markdown: str, temario: str) -> str:
+    """Replace one contradicted OS with the single OS family the syllabus names.
+
+    ``B5_REPAIR=0`` skips the pass. Several syllabus families, or an OS the
+    syllabus never named, stay a warning.
+    """
+    if os.environ.get("B5_REPAIR", "1") == "0" or not (temario or "").strip():
+        return markdown or ""
+    informe = auditar_requisitos(markdown or "", "", temario=temario)
+    contradicciones = [
+        item for item in informe["contradicciones"] if item.get("tipo") == "os_temario"
+    ]
+    if not contradicciones:
+        return markdown or ""
+    declarado = contradicciones[0].get("declarado") or []
+    if len(declarado) != 1:
+        return markdown or ""
+    if any((item.get("declarado") or []) != declarado for item in contradicciones):
+        return markdown or ""
+    familia = str(declarado[0])
+    visible = "Windows" if familia == "windows" else "Linux" if familia == "linux" else familia
+    texto = markdown or ""
+    for item in contradicciones:
+        valor = str(item.get("valor") or "")
+        if valor and valor in texto:
+            texto = texto.replace(valor, visible)
+    return texto

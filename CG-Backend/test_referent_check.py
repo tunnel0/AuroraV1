@@ -33,15 +33,24 @@ _CARPETA_PLANNER = os.path.join("lambda", "strands_lab_planner")
 for _ruta in (_CARPETA_WRITER, _CARPETA_PLANNER, "lambda"):
     sys.path.insert(0, os.path.join(_HERE, _ruta))
 
+# Planner is the copy this import must bind. A previous test may have loaded
+# the writer sibling under the same name.
+sys.modules.pop("referent_check", None)
 from referent_check import (  # noqa: E402
     auditar_contrato,
     auditar_duraciones_curso,
+    auditar_duracion,
     auditar_laboratorio,
     auditar_plan,
+    carga_de_laboratorio,
     canonico,
     duracion_declarada,
     entorno_de_peticion,
+    auditar_requisitos,
+    extraer_anclajes,
     extraer_referentes,
+    reparar_anclajes_en_guia,
+    reparar_requisitos_contra_temario,
     mensaje_de_correccion,
     preflight_duracion,
     presupuesto_de_duracion,
@@ -413,6 +422,10 @@ def test_la_state_machine_pasa_el_contexto_al_expansor_de_lotes():
         if not str(parametros.get("FunctionName", "")).endswith(":function:LabBatchExpander"):
             continue
         encontrados += 1
+        # The whole state is passed so a missing optional key is not States.Runtime.
+        # The expander still reads outline_s3_key and manual_text_s3_key with .get.
+        if parametros.get("Payload.$") == "$":
+            continue
         payload = parametros.get("Payload") or {}
         assert "outline_s3_key.$" in payload, f"{nombre} no pasa el temario al expansor"
         assert "manual_text_s3_key.$" in payload, f"{nombre} no pasa el manual al expansor"
@@ -477,6 +490,7 @@ def _ejecutar_writer(
     objetos=None,
     existentes=None,
     almacen=None,
+    guias=None,
 ):
     """Ejecuta el handler real del Writer con S3 y el modelo simulados.
 
@@ -500,15 +514,22 @@ def _ejecutar_writer(
 
     def _generador_falso(lab_plans, master_context, model_provider="bedrock",
                          lesson_content="", previous_lab_context=""):
-        contextos.append(dict(master_context))
+        ctx = dict(master_context)
+        ctx["_previous_lab_context"] = previous_lab_context
+        contextos.append(ctx)
         indice = min(len(contextos), len(contenidos)) - 1
         return {lab_plans[0]["lab_id"]: contenidos[indice]}
+
+    def _guardar(**kw):
+        if guias is not None:
+            guias.append(kw.get("lab_guide") or "")
+        return f"p/labguide/lab-{kw['lab_id']}.md"
 
     modulo.generate_all_labs_batch = _generador_falso
     modulo._verify_and_refine_lab_guide = lambda guide, plan_, ctx, model_provider="bedrock": guide
     modulo._finalize_lab_markdown = lambda markdown, is_demo, is_spanish=True: markdown
     modulo.load_master_plan_from_s3 = lambda bucket, key: plan
-    modulo.save_lab_guide_to_s3 = lambda **kw: f"p/labguide/lab-{kw['lab_id']}.md"
+    modulo.save_lab_guide_to_s3 = _guardar
     modulo._lab_skip_if_exists_enabled = lambda: False
     modulo._find_existing_lab_guide_key = lambda bucket, project, lab_id: (
         (existentes or {}).get(lab_id)
@@ -1204,12 +1225,18 @@ def test_el_reintento_se_puede_desactivar_sin_cambiar_el_plan():
 
 
 def test_el_writer_con_reintento_desactivado_no_regenera_el_lab():
+    """REFERENTIAL_RETRY=0 no vuelve a llamar al modelo.
+
+    El xlsx que nadie entregó sí se incorpora: es un anexo determinista, no un
+    reintento. La guía que se guarda puede ejecutarse sola.
+    """
     plan = {"lab_plans": [_LAB_PLAN]}
+    guias = []
     anterior = os.environ.get("REFERENTIAL_RETRY")
     os.environ["REFERENTIAL_RETRY"] = "0"
     try:
         resultado, informes, contextos = _ejecutar_writer(
-            plan, [_LAB_CON_INVENTO], max_intentos=3
+            plan, [_LAB_CON_INVENTO], max_intentos=3, guias=guias
         )
     finally:
         if anterior is None:
@@ -1219,7 +1246,9 @@ def test_el_writer_con_reintento_desactivado_no_regenera_el_lab():
 
     assert resultado["statusCode"] == 200, resultado
     assert len(contextos) == 1, "REFERENTIAL_RETRY=0 no debe regenerar el laboratorio"
-    assert informes and informes[0]["ok"] is False
+    assert guias and "Anexo (datos ficticios)" in guias[0]
+    assert "Demanda_Historica.xlsx" in guias[0]
+    assert informes and informes[0]["ok"] is True, informes
 
 
 # --------------------------------------------------------------------------- #
@@ -1382,8 +1411,13 @@ def test_b2_control_un_laboratorio_anterior_o_el_propio_no_es_posterior():
     ) == []
 
 
-def test_el_writer_acepta_un_fichero_creado_en_el_laboratorio_anterior():
-    """Camino vivo de B3: el lote escribe el lab 2 y lee del S3 el lab 1 ya generado."""
+def test_el_writer_no_depende_del_csv_creado_en_el_laboratorio_anterior():
+    """Camino vivo: el csv del lab 1 no exime al lab 2.
+
+    El modelo tiene los reintentos para quitar la dependencia. Si el texto que
+    se acepta sigue abriendo ese csv, la guía lo trae en un anexo ficticio.
+    """
+    guias = []
     resultado, informes, contextos = _ejecutar_writer(
         _PLAN_DOS_LABS,
         [_LAB_QUE_ABRE_LO_DEL_LAB_ANTERIOR],
@@ -1393,11 +1427,22 @@ def test_el_writer_acepta_un_fichero_creado_en_el_laboratorio_anterior():
             "p/labguide/lab-01-01-01-preparar.md": _LAB_QUE_CREA_LA_ENTRADA,
         },
         existentes={"01-01-01": "p/labguide/lab-01-01-01-preparar.md"},
+        guias=guias,
     )
 
     assert resultado["statusCode"] == 200, resultado
-    assert len(contextos) == 1, "B3 debe evitar el reintento: el fichero lo creó el lab 1"
+    previo = contextos[0].get("_previous_lab_context") or ""
+    assert "Reuse the EXACT" not in previo
+    assert "Do NOT re-create" not in previo
+    assert not contextos[0].get("referential_correction")
+    assert len(contextos) == 3, "debe pedir corrección antes de anexar"
+    assert "ventas_limpias.csv" in (contextos[1].get("referential_correction") or "")
+    assert guias and "Anexo (datos ficticios)" in guias[0]
+    assert "ventas_limpias.csv" in guias[0]
+    assert "ficticios" in guias[0]
     assert informes and informes[0]["ok"] is True, informes
+    suelto = auditar_laboratorio(guias[0], fuentes=_FUENTES)
+    assert suelto["ok"] is True, suelto["violaciones"]
 
 
 def test_el_writer_reintenta_si_depende_de_la_salida_del_laboratorio_posterior():
@@ -1436,7 +1481,9 @@ def test_el_writer_registra_b2_sin_reintentar_si_el_interruptor_esta_apagado():
 
     assert resultado["statusCode"] == 200, resultado
     assert len(contextos) == 1, "REFERENTIAL_RETRY=0 no debe regenerar"
-    assert informes and informes[0]["total_b2"] == 1, informes
+    assert informes and informes[0]["total_b2"] == 0, informes
+    por_lab = informes[0]["por_laboratorio"]["01-01-01"]
+    assert "practica1_mape_sku.xlsx" in por_lab["creados"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1701,6 +1748,28 @@ def test_b5_contradice_el_sistema_operativo_del_plan():
     b5 = [v for v in informe["violaciones"] if v["verificacion"] == "B5"]
     assert [v["valor"] for v in b5] == ["Windows"]
     assert b5[0]["confianza"] == "alta"
+
+def test_b5_un_os_alternativo_junto_al_declarado_no_contradice():
+    """MS-4018: «Windows 10/11 o macOS» con un plan que declara Windows."""
+    lab = "## Entorno\n| Sistema operativo | Windows 10/11 o macOS con navegador compatible |\n"
+    requisitos = requisitos_declarados(
+        [{"name": "Sistema operativo", "version": "Windows 10/11", "purpose": "equipo del alumno"}],
+        [],
+    )
+    informe = auditar_laboratorio(lab, fuentes="temario", requisitos_texto=requisitos)
+    assert not [v for v in informe["violaciones"] if v["verificacion"] == "B5"]
+
+
+def test_b5_un_os_distinto_sin_el_declarado_sigue_contradiciendo():
+    lab = "## Entorno\n| Sistema operativo | macOS 14 con navegador compatible (requisito) |\n"
+    requisitos = requisitos_declarados(
+        [{"name": "Sistema operativo", "version": "Windows 10/11", "purpose": "equipo del alumno"}],
+        [],
+    )
+    informe = auditar_laboratorio(lab, fuentes="temario", requisitos_texto=requisitos)
+    b5 = [v for v in informe["violaciones"] if v["verificacion"] == "B5"]
+    assert [v["valor"] for v in b5] == ["macOS"]
+
 
 def test_b5_contradice_la_version_de_una_herramienta():
     lab = "## Descripción\nEl entorno requiere Node 22.14.0 para ejecutar las pruebas.\n"
@@ -2648,6 +2717,73 @@ def test_b6_una_desviacion_pequena_no_marca():
     assert [v for v in informe["violaciones"] if v["verificacion"] == "B6"] == []
 
 
+def _lab_copilot_prosa(duracion, palabras_totales=3400, pasos=3):
+    """Laboratorio Copilot solo prosa, sin bloques de shell ni código."""
+    palabras_por_paso = max(
+        1, (palabras_totales - pasos * 175) // pasos
+    )
+    cabecera = (
+        f"# Lab 05-00-01: Copilot en Excel\n\n"
+        f"| **Duración** | {duracion} minutos |\n\n"
+    )
+    cuerpo = []
+    for paso in range(1, pasos + 1):
+        lectura = " ".join(f"t{j}" for j in range(palabras_por_paso))
+        cuerpo.extend(
+            [
+                f"### Paso {paso}: Analizar ventas con Copilot\n",
+                "**Objetivo:** Usar Copilot para resumir datos.\n",
+                "1. Abra el archivo compartido en Excel de escritorio.\n",
+                "2. Haga clic en Copilot en la cinta de opciones.\n",
+                f"3. Lea el contexto del escenario y siga las indicaciones.\n\n{lectura}\n",
+                "**Prompt para Copilot:**\n",
+                "```prompt\n",
+                "Resume las ventas por región y propone tres acciones de seguimiento.\n",
+                "```\n",
+                "**Verificación:** Copilot devuelve un resumen con al menos tres regiones.\n",
+            ]
+        )
+    return cabecera + "\n".join(cuerpo)
+
+
+def test_b6_cuenta_carga_gui_y_lectura_en_laboratorio_copilot():
+    lab = _lab_copilot_prosa(15, palabras_totales=3600)
+    carga = carga_de_laboratorio(lab)
+    assert carga["bloques"] == 0
+    assert carga["pasos"] == 3
+    assert carga["pasos_gui"] == 3
+    assert carga["prompts"] >= 3
+    assert carga["validaciones"] == 3
+    assert carga["minutos_lectura"] >= 17
+
+
+def test_b6_marca_un_copilot_prosa_que_solo_cabe_en_17_minutos_declarado_15():
+    """17 minutos solo de lectura no caben en 15 declarados (auditoría THOR, ítem 5)."""
+    lab = _lab_copilot_prosa(15, palabras_totales=3600)
+    informe = auditar_laboratorio(lab, "")
+    b6 = [v for v in informe["violaciones"] if v["verificacion"] == "B6"]
+    assert len(b6) == 1, informe["violaciones"]
+    assert b6[0]["confianza"] == "alta"
+    assert informe["duracion"]["minutos_lectura"] >= 17
+    assert informe["duracion"]["ok"] is False
+
+
+def test_b6_marca_el_caso_de_auditoria_10_minutos_y_17_de_lectura():
+    """Tres pasos Copilot sin cercas: antes B6 devolvía ok por falta de bloques."""
+    lab = _lab_copilot_prosa(10, palabras_totales=3600)
+    resultado = auditar_duracion(lab, 10)
+    assert resultado["ok"] is False
+    assert resultado["motivo"] != "sin pasos de acción suficientes para comparar"
+
+
+def test_b6_no_marca_un_copilot_prosa_que_cabe_en_lo_declarado():
+    lab = _lab_copilot_prosa(20, palabras_totales=2400)
+    informe = auditar_laboratorio(lab, "")
+    assert [v for v in informe["violaciones"] if v["verificacion"] == "B6"] == []
+    assert informe["duracion"]["minutos_lectura"] <= 14
+    assert informe["duracion"]["duracion_maxima"] == 26
+
+
 def test_el_mensaje_de_b6_pide_caber_en_lo_declarado_y_no_cambiar_la_duracion():
     """El reintento debe saber cuánto recortar, y que la duración no se toca.
 
@@ -2941,6 +3077,28 @@ def test_el_preflight_avisa_de_un_temario_sobre_comprometido():
     assert set(modulo["senales"]) == {"sobre_comprometido", "poco_tiempo"}
 
 
+def test_el_preflight_usa_los_minutos_del_plan_ya_rebalanceado():
+    """60 min declared against a 27 min practice budget warns until the plan is scaled."""
+    curso = {
+        "modules": [
+            {
+                "duration_minutes": 90,
+                "percent_practice": 30,
+                "lab_activities": [{"duration_minutes": 60}],
+            }
+        ]
+    }
+    laboratorios = [{"lab_id": "01-00-01"}]
+    crudo = preflight_duracion(curso, laboratorios)
+    assert crudo["modulos"][0]["por_laboratorio"] == 27.0
+    assert "sobre_comprometido" in crudo["modulos"][0]["senales"]
+    ajustado = preflight_duracion(curso, laboratorios, minutos_plan={"01": 27})
+    assert ajustado["modulos"][0]["senales"] == []
+    assert ajustado["avisos"] == 0
+    assert ajustado["modulos"][0]["pedido_temario"] == 60.0
+    assert ajustado["modulos"][0]["pedido_actividades"] == 27.0
+
+
 def test_el_preflight_no_avisa_de_un_temario_consistente():
     curso = {
         "modules": [
@@ -2987,7 +3145,11 @@ def test_el_preflight_registra_el_modulo_sin_porcentaje_de_practica():
 
 
 def test_el_planner_guarda_el_preflight_en_los_metadatos():
-    """Camino vivo: el handler real deja el aviso en el plan guardado."""
+    """Camino vivo: el pre-flight queda en el plan, ya con el presupuesto aplicado.
+
+    Nueve prácticas de 12 min en un módulo de 85,5 min de práctica no se generan:
+    el formato las reúne hasta que cada una tiene al menos 12 minutos.
+    """
     modulo = _cargar_modulo("strands_lab_planner", _CARPETA_PLANNER)
     outline = {
         "course": {
@@ -3023,9 +3185,18 @@ def test_el_planner_guarda_el_preflight_en_los_metadatos():
             ]
         },
     )
+    assert len(plan["lab_plans"]) == 7
+    assert sum(p["estimated_duration"] for p in plan["lab_plans"]) <= 85
     preflight = plan["metadata"]["preflight_duracion"]
-    assert preflight["avisos"] == 1, preflight
-    assert preflight["modulos"][0]["por_laboratorio"] == 9.5
+    assert preflight["antes"]["avisos"] == 1
+    assert "sobre_comprometido" in preflight["antes"]["modulos"][0]["senales"]
+    assert preflight["avisos"] == 0, preflight
+    assert preflight["modulos"][0]["laboratorios"] == 7
+    assert preflight["modulos"][0]["por_laboratorio"] >= 12
+    assert "poco_tiempo" not in preflight["modulos"][0]["senales"]
+    assert "sobre_comprometido" not in preflight["modulos"][0]["senales"]
+    assert preflight["gate"]["aplicado"] is True
+    assert plan["metadata"]["format_budget"]["ajustado"] is True
 
 
 def test_a2_marca_una_cantidad_cambiada():
@@ -3120,6 +3291,25 @@ def test_a2_el_plan_con_la_cantidad_correcta_no_marca():
     }
     informe = auditar_plan(plan, fuentes)
     assert [v for v in informe["violaciones"] if v["verificacion"] == "A2"] == []
+
+
+def test_a2_extrae_seis_fondos_en_revision_interna_ms_4019():
+    """§31.3: «revisión» y «comparativo» son sustantivos, no verbos de instrucción."""
+    fuentes = (
+        "En el contexto de CIBEST CAPITAL, una revisión interna de seis fondos "
+        "multiactivo ficticios."
+    )
+    lab = (
+        "## Contexto\n"
+        "Realiza un análisis comparativo de tres fondos multiactivo.\n\n"
+        "### Paso 1: Revisar\n```bash\nls\n```\n"
+    )
+    informe = auditar_laboratorio(lab, fuentes)
+    a2 = [v for v in informe["violaciones"] if v["verificacion"] == "A2"]
+    assert len(a2) == 1, informe["violaciones"]
+    assert a2[0]["esperado"] == 6
+    assert a2[0]["obtenido"] == 3
+    assert a2[0]["confianza"] == "alta"
 
 
 def test_a2_la_reconciliacion_copia_la_cantidad_del_temario():
@@ -3466,6 +3656,429 @@ def test_para_confirmar_no_es_un_marcador():
     assert confianzas["Datos_Financieros_Q4.xlsx"] == "alta"
 
 
+def test_caso_eml_y_sharepoint_sites_son_dependencias_no_declaradas():
+    """Ejemplo del audit: ``caso.eml`` y una ruta ``/sites/`` no pueden quedar invisibles."""
+    lab = (
+        "# Lab\n"
+        "### Paso 1: Abrir el correo\n"
+        "Abra el archivo caso.eml y revise el remitente.\n\n"
+        "### Paso 2: Abrir el libro en SharePoint\n"
+        "Abra el archivo /sites/CursoTHOR/Documentos/Ventas_MultiRegional_2024.xlsx "
+        "y revise las ventas.\n"
+    )
+    informe = auditar_laboratorio(lab, fuentes="")
+    valores = {v["valor"] for v in informe["violaciones"]}
+    assert "caso.eml" in valores, informe["violaciones"]
+    assert any("/sites/" in v.replace("\\", "/") for v in valores), valores
+    altas = [
+        v for v in informe["violaciones"]
+        if v.get("confianza") == "alta" and v.get("verificacion") == "B1"
+    ]
+    assert len(altas) >= 2, informe["violaciones"]
+
+
+def test_el_prompt_vivo_no_pide_reutilizar_el_laboratorio_anterior():
+    """El prompt compacto es el camino vivo. No puede ordenar reutilizar el lab anterior."""
+    modulo = _cargar_modulo("strands_lab_writer", _CARPETA_WRITER)
+    prompt = modulo._compact_single_lab_prompt(
+        _LAB_PLAN,
+        {"target_language": "Spanish (Español)"},
+        "",
+        "resumen del lab",
+        previous_lab_context_section=(
+            "CONTEXT FROM PREVIOUS LAB\n"
+            "Reuse the EXACT same database names\n"
+            "Do NOT re-create entities that already exist"
+        ),
+    )
+    assert "Reuse the EXACT" not in prompt
+    assert "Do NOT re-create" not in prompt
+    assert "CONTEXT FROM PREVIOUS LAB" not in prompt
+    assert "Anexo (datos ficticios)" in prompt
+    assert "run alone" in prompt
+    assert modulo._get_previous_lab_context("bucket", "p", "01-01-01") == ""
+
+    prompt_en = modulo._compact_single_lab_prompt(
+        _LAB_PLAN,
+        {"target_language": "English"},
+        "",
+        "lab summary",
+    )
+    assert "Annex (fictitious data)" in prompt_en
+    assert "Reuse the EXACT" not in prompt_en
+
+
+def test_el_anexo_inline_deja_excel_word_eml_csv_y_sharepoint_en_el_lab():
+    """Si el temario no entrega el fichero, la guía lo trae como datos ficticios."""
+    modulo = _cargar_modulo("strands_lab_writer", _CARPETA_WRITER)
+    lab = """# Lab
+### Paso 1: Abrir el correo
+Abra el archivo caso.eml y revise el remitente.
+
+### Paso 2: Abrir el libro
+Abra el archivo Ventas_MultiRegional_2024.xlsx y sume la columna de unidades.
+
+### Paso 3: Abrir la hoja
+Abra el archivo ventas_regionales.csv y filtre la region.
+
+### Paso 4: Abrir el documento
+Abra el archivo Politica_Vacaciones.docx y lea la nota.
+
+### Paso 5: Sitio de SharePoint
+Abra el material en /sites/CursoTHOR/MaterialCurso antes de continuar.
+
+### Paso 6: Libro en SharePoint
+Abra el archivo /sites/CursoTHOR/Documentos/Libro_SharePoint.xlsx y revise la hoja.
+"""
+    antes = auditar_laboratorio(lab, fuentes="")
+    assert antes["ok"] is False
+    despues = modulo.anexar_entradas_no_entregadas(lab, antes, is_spanish=True)
+    assert despues.count("## Anexo (datos ficticios)") == 1
+    for nombre in (
+        "caso.eml",
+        "Ventas_MultiRegional_2024.xlsx",
+        "ventas_regionales.csv",
+        "Politica_Vacaciones.docx",
+        "/sites/CursoTHOR/MaterialCurso",
+        "Libro_SharePoint.xlsx",
+    ):
+        assert nombre in despues, nombre
+    assert "ficticios" in despues
+    assert "From: aviso@ejemplo.test" in despues
+    informe = auditar_laboratorio(despues, fuentes="")
+    assert informe["ok"] is True, informe["violaciones"]
+    otra_vez = modulo.anexar_entradas_no_entregadas(despues, informe, is_spanish=True)
+    assert otra_vez == despues
+
+    base_en = "### Paso 1: Abrir el correo\nAbra el archivo caso.eml y revise el remitente.\n"
+    en_ingles = modulo.anexar_entradas_no_entregadas(
+        base_en, auditar_laboratorio(base_en, fuentes=""), is_spanish=False
+    )
+    assert "## Annex (fictitious data)" in en_ingles
+    assert auditar_laboratorio(en_ingles, fuentes="")["ok"] is True
+
+
+def test_el_anexo_incluye_la_salida_de_un_laboratorio_posterior():
+    """B2 is still detected, then a fictitious copy is inlined so the lab runs alone."""
+    informe = auditar_laboratorio(
+        _LAB_QUE_USA_LA_SALIDA_POSTERIOR,
+        fuentes=_FUENTES,
+        salidas_posteriores={"01-01-02": ["Practica1_MAPE_SKU.xlsx"]},
+    )
+    assert any(v["verificacion"] == "B2" for v in informe["violaciones"])
+    modulo = _cargar_modulo("strands_lab_writer", _CARPETA_WRITER)
+    despues = modulo.anexar_entradas_no_entregadas(
+        _LAB_QUE_USA_LA_SALIDA_POSTERIOR, informe, is_spanish=True
+    )
+    assert "Practica1_MAPE_SKU.xlsx" in despues
+    assert "Anexo (datos ficticios)" in despues
+    cerrado = auditar_laboratorio(
+        despues,
+        fuentes=_FUENTES,
+        salidas_posteriores={"01-01-02": ["Practica1_MAPE_SKU.xlsx"]},
+    )
+    assert not any(v["verificacion"] == "B2" for v in cerrado["violaciones"])
+
+
+def test_el_anexo_no_repite_un_fichero_que_el_temario_entrega():
+    modulo = _cargar_modulo("strands_lab_writer", _CARPETA_WRITER)
+    lab = "### Paso 1: Abrir\nAbra el archivo datos_ventas.xlsx y revise las columnas.\n"
+    informe = auditar_laboratorio(lab, fuentes=_FUENTES)
+    assert informe["ok"] is True, informe["violaciones"]
+    assert modulo.anexar_entradas_no_entregadas(lab, informe, is_spanish=True) == lab
+
+
+def test_el_writer_no_acepta_un_fichero_de_otro_laboratorio_como_entrada():
+    """B3c ya no satisface una entrada que el alumno no tiene en este capítulo."""
+    lab_previo = "# Lab 01-01-01: Preparar\n\n### Paso 1: Crear el script\ncat > preparar_datos.py\n"
+    lab_actual = (
+        "# Lab 01-01-02: Revisar\n\n### Paso 1: Abrir el script\n"
+        "Abra el archivo preparar_datos.py y revise las funciones.\n"
+    )
+    guias = []
+    resultado, informes, contextos = _ejecutar_writer(
+        _PLAN_DOS_LABS,
+        [lab_actual],
+        max_intentos=1,
+        lab_ids=["01-01-02"],
+        objetos={"p/labguide/lab-01-01-01-preparar.md": lab_previo},
+        existentes={"01-01-01": "p/labguide/lab-01-01-01-preparar.md"},
+        guias=guias,
+    )
+    assert resultado["statusCode"] == 200, resultado
+    assert "Reuse the EXACT" not in (contextos[0].get("_previous_lab_context") or "")
+    assert informes and informes[0]["ok"] is False, informes
+    valores = [
+        v["valor"]
+        for r in informes[0]["por_laboratorio"].values()
+        for v in r["violaciones"]
+    ]
+    assert "preparar_datos.py" in valores, valores
+    assert guias and "Anexo (datos ficticios)" not in guias[0]
+
+_TEMARIO_CIBEST = (
+    "En el contexto de CIBEST CAPITAL, una revisión interna de seis fondos "
+    "multiactivo. El escenario se sitúa en El Salvador.\n"
+    "La práctica no debe incluir recomendaciones de inversión.\n"
+    "Entregable: Presentación ejecutiva\n"
+)
+
+
+def _a2e(informe):
+    return [v for v in informe["violaciones"] if v.get("verificacion") == "A2e"]
+
+
+def test_a2e_cibest_no_puede_ser_northstar():
+    """The syllabus company is kept. Northstar Digital is a replacement, not a new heading."""
+    lab = (
+        "## Descripción General\n"
+        "En el contexto de Northstar Digital, el estudiante compara los fondos.\n\n"
+        "### Paso 1: Revisar\n"
+        "1. Anote el nombre de la empresa y el país del caso.\n"
+        "El escenario se sitúa en El Salvador. No incluya recomendaciones de inversión.\n"
+        "El cierre es la Presentación ejecutiva.\n"
+    )
+    informe = auditar_laboratorio(lab, _TEMARIO_CIBEST)
+    a2e = _a2e(informe)
+    assert len(a2e) == 1, a2e
+    assert a2e[0]["confianza"] == "alta"
+    assert a2e[0]["tipo"] == "entidad"
+    assert a2e[0]["esperado"] == "CIBEST CAPITAL"
+    assert a2e[0]["obtenido"] == "Northstar Digital"
+    assert a2e[0]["detalle"] == "reemplazo"
+    assert {"valor", "tipo", "inicio", "confianza", "verificacion"} <= set(a2e[0])
+
+
+def test_a2e_el_salvador_no_puede_ser_spain_ni_la_ue():
+    """A declared country is not rewritten as Spain or the EU."""
+    lab = (
+        "## Descripción General\n"
+        "En el contexto de CIBEST CAPITAL. El escenario se sitúa en Spain / EU "
+        "y la operación cubre la Unión Europea.\n\n"
+        "### Paso 1: Revisar\n"
+        "1. Anote la sede. No incluya recomendaciones de inversión.\n"
+        "Entregue la Presentación ejecutiva.\n"
+    )
+    informe = auditar_laboratorio(lab, _TEMARIO_CIBEST)
+    lugares = [v for v in _a2e(informe) if v["tipo"] == "lugar"]
+    assert len(lugares) == 1, _a2e(informe)
+    assert lugares[0]["confianza"] == "alta"
+    assert lugares[0]["esperado"] == "El Salvador"
+    assert "Spain" in lugares[0]["obtenido"]
+    assert "EU" in lugares[0]["obtenido"] or "Unión Europea" in lugares[0]["obtenido"]
+    assert all(v["esperado"] != "CIBEST CAPITAL" or v["detalle"] != "reemplazo" for v in _a2e(informe))
+
+
+def test_a2e_el_nombre_igual_no_marca():
+    """Title case and a different name inside a code fence are still the syllabus name."""
+    lab = (
+        "## Descripción General\n"
+        "En el contexto de Cibest Capital, el escenario se sitúa en El Salvador.\n"
+        "No incluya recomendaciones de inversión.\n"
+        "El cierre es la Presentación ejecutiva.\n\n"
+        "### Paso 1: Anotar\n"
+        "1. Lea el nombre.\n"
+        "```text\n"
+        "Northstar Digital opera en España.\n"
+        "```\n"
+    )
+    informe = auditar_laboratorio(lab, _TEMARIO_CIBEST)
+    assert _a2e(informe) == []
+
+
+def test_a2e_no_marca_frases_capitalizadas_sueltas():
+    """§32: Salida Esperada, Microsoft Edge, Copilot Studio and Carlos Mendoza are not entities.
+
+    The syllabus never declares them. A guide full of those strings is clean.
+    """
+    temario = """
+course:
+  title: "Copilot para productividad"
+  description: "Use Microsoft Edge y Copilot Studio en un seminario."
+  El curso menciona España como ejemplo de formato de fecha.
+  «Microsoft Edge» «Copilot Studio» «Salida Esperada» «Nivel Bloom»
+"""
+    lab = (
+        "## Descripción General\n"
+        "Abra Microsoft Edge y Copilot Studio. Carlos Mendoza revisa el Nivel Bloom.\n"
+        "**Salida Esperada:** una tabla. Equipo Intel Core i7.\n"
+        "Northstar Digital aparece en un párrafo sin rol declarado.\n\n"
+        "### Paso 1: Abrir\n"
+        "1. Abra el navegador.\n"
+    )
+    anclajes = extraer_anclajes(temario)
+    nombres = [e["nombre"] for e in anclajes["entidades"]]
+    assert "Microsoft Edge" in nombres
+    assert "Copilot Studio" in nombres
+    assert "España" not in nombres
+    assert "Salida Esperada" not in nombres
+    assert anclajes["prohibiciones"] == []
+    informe = auditar_laboratorio(lab, temario)
+    assert _a2e(informe) == [], _a2e(informe)
+
+
+def test_a2e_prohibicion_no_debe_incluir():
+    """A syllabus 'no debe incluir' is a finding only when the guide affirms it."""
+    temario = "La práctica no debe incluir recomendaciones de inversión."
+    prohibida = (
+        "## Descripción General\n"
+        "Redacte la recomendación de inversión para el comité.\n\n"
+        "### Paso 1: Redactar\n"
+        "1. Escriba la recomendación y guárdela.\n"
+    )
+    cumplida = (
+        "## Descripción General\n"
+        "No incluya recomendaciones de inversión en el informe.\n\n"
+        "### Paso 1: Revisar\n"
+        "1. Lea la política del caso.\n"
+    )
+    mala = auditar_laboratorio(prohibida, temario)
+    hits = [v for v in _a2e(mala) if v["detalle"] == "prohibicion"]
+    assert len(hits) == 1, _a2e(mala)
+    assert hits[0]["confianza"] == "alta"
+    assert "recomendaciones de inversión" in hits[0]["valor"]
+    assert _a2e(auditar_laboratorio(cumplida, temario)) == []
+    assert extraer_anclajes("El alumno no debe ser breve.")["prohibiciones"] == []
+
+
+def test_a2e_entregable_omitido():
+    """A deliverable the syllabus names, with no filename, must still appear."""
+    temario = "Entregables: Idea Coach; Presentación ejecutiva\n"
+    omitida = (
+        "## Descripción General\n"
+        "El cierre usa Idea Coach para bosquejar el mensaje.\n\n"
+        "### Paso 1: Bosquejar\n"
+        "1. Abra la herramienta y anote tres ideas.\n"
+    )
+    completa = (
+        "## Descripción General\n"
+        "Produzca Idea Coach y la Presentación ejecutiva.\n\n"
+        "### Paso 1: Cerrar\n"
+        "1. Guarde ambos resultados.\n"
+    )
+    hallazgos = _a2e(auditar_laboratorio(omitida, temario))
+    assert len(hallazgos) == 1, hallazgos
+    assert hallazgos[0]["tipo"] == "entregable"
+    assert hallazgos[0]["confianza"] == "alta"
+    assert hallazgos[0]["esperado"] == "Presentación ejecutiva"
+    assert _a2e(auditar_laboratorio(completa, temario)) == []
+
+
+def test_a2e_comillas_parentesis_y_yaml_fijan_el_nombre():
+    citado = extraer_anclajes('El cliente del caso es «CIBEST CAPITAL».')
+    assert [e["nombre"] for e in citado["entidades"]] == ["CIBEST CAPITAL"]
+    parentesis = extraer_anclajes('title: "Preparación (CIBEST CAPITAL)"')
+    assert [e["nombre"] for e in parentesis["entidades"]] == ["CIBEST CAPITAL"]
+    yaml = extraer_anclajes('empresa: "CIBEST CAPITAL"\npaís: El Salvador\n')
+    roles = {e["rol"]: e["nombre"] for e in yaml["entidades"]}
+    assert roles["organizacion"] == "CIBEST CAPITAL"
+    assert roles["lugar"] == "El Salvador"
+
+
+def test_a2e_mensaje_de_correccion_nombra_la_entidad():
+    lab = (
+        "## Descripción General\n"
+        "En el contexto de Northstar Digital.\n\n"
+        "### Paso 1: Revisar\n"
+        "1. Lea el caso.\n"
+    )
+    informe = auditar_laboratorio(lab, "En el contexto de CIBEST CAPITAL.")
+    mensaje = mensaje_de_correccion(informe["violaciones"], "lab")
+    assert "CIBEST CAPITAL" in mensaje
+    assert "Northstar Digital" in mensaje
+    assert "temario" in mensaje
+
+
+def test_el_prompt_del_lab_fija_las_entidades_del_temario():
+    """Live compact prompt: the lock is injected from the syllabus, and absent without one."""
+    modulo = _cargar_modulo("strands_lab_writer", _CARPETA_WRITER)
+    prompt = modulo._compact_single_lab_prompt(
+        _lab_de_prueba(),
+        {
+            "target_language": "Spanish (Español)",
+            "syllabus_text": _TEMARIO_CIBEST,
+        },
+        "",
+        "resumen del lab",
+    )
+    assert "ENTIDADES BLOQUEADAS" in prompt
+    assert "CIBEST CAPITAL" in prompt
+    assert "El Salvador" in prompt
+    assert "Presentación ejecutiva" in prompt
+    assert "recomendaciones de inversión" in prompt
+    assert "aunque el plan use un nombre distinto" in prompt
+
+    vacio = modulo._compact_single_lab_prompt(
+        _lab_de_prueba(),
+        {"target_language": "Spanish (Español)"},
+        "",
+        "resumen del lab",
+    )
+    assert "ENTIDADES BLOQUEADAS" not in vacio
+
+    ingles = modulo._compact_single_lab_prompt(
+        _lab_de_prueba(),
+        {"target_language": "English", "syllabus_text": _TEMARIO_CIBEST},
+        "",
+        "resumen del lab",
+    )
+    assert "LOCKED ENTITIES" in ingles
+    assert "CIBEST CAPITAL" in ingles
+
+
+_LAB_QUE_RENONBRA_EL_ESCENARIO = """# Lab 01-01-01: Analizar fondos
+
+## Descripcion General
+En el contexto de Northstar Digital. El escenario se sitúa en Spain / EU.
+Redacte la recomendación de inversión del comité.
+
+### Paso 1: Revisar
+**Objective:** Leer el caso.
+**Instructions:**
+1. Anote la empresa y el país que usa la guía.
+**Expected output:** El nombre anotado.
+**Verification:** El nombre coincide con el enunciado.
+"""
+
+_LAB_QUE_RESPETA_EL_ESCENARIO = """# Lab 01-01-01: Analizar fondos
+
+## Descripcion General
+En el contexto de CIBEST CAPITAL. El escenario se sitúa en El Salvador.
+No incluya recomendaciones de inversión.
+El cierre es la Presentación ejecutiva.
+
+### Paso 1: Revisar
+**Objective:** Leer el caso.
+**Instructions:**
+1. Anote la empresa y el país que declara el temario.
+**Expected output:** El nombre anotado.
+**Verification:** El nombre coincide con el enunciado.
+"""
+
+
+def test_el_writer_reintenta_si_la_guia_renombra_el_escenario():
+    """Live handler: a renamed syllabus entity is a high-confidence finding and a retry."""
+    resultado, informes, contextos = _ejecutar_writer(
+        {"lab_plans": [_LAB_PLAN]},
+        [_LAB_QUE_RENONBRA_EL_ESCENARIO, _LAB_QUE_RESPETA_EL_ESCENARIO],
+        max_intentos=3,
+        objetos={"p/outline.yaml": _TEMARIO_CIBEST},
+    )
+    assert resultado["statusCode"] == 200, resultado
+    assert len(contextos) == 2, "el writer debió reintentar al sustituir la entidad"
+    assert "CIBEST CAPITAL" in (contextos[0].get("syllabus_text") or "")
+    correccion = contextos[1].get("referential_correction") or ""
+    assert "CIBEST CAPITAL" in correccion
+    assert "El Salvador" in correccion
+    assert informes, "no se escribió el informe"
+    finales = [
+        v
+        for v in informes[0]["por_laboratorio"]["01-01-01"]["violaciones"]
+        if v.get("verificacion") == "A2e"
+    ]
+    assert finales == [], finales
+
+
 def test_una_plantilla_completar_no_exime():
     """`[COMPLETAR]` es un hueco que rellena el alumno, no una marca de confirmación
     para el instructor: no puede exonerar el fichero de la misma tabla."""
@@ -3479,6 +4092,81 @@ def test_una_plantilla_completar_no_exime():
     )
     informe = auditar_laboratorio(lab, "")
     assert informe["marcados"] == []
+
+
+def test_el_anexo_incluye_un_fichero_de_un_laboratorio_posterior():
+    """A file a later lab produces is inlined so this lab still runs alone."""
+    modulo = _cargar_modulo("strands_lab_writer", _CARPETA_WRITER)
+    lab = (
+        "# Lab\n"
+        "### Paso 1: Abrir\n"
+        "Abra el archivo informe_final.xlsx antes de continuar.\n"
+    )
+    informe = auditar_laboratorio(
+        lab,
+        fuentes="",
+        salidas_posteriores={"02-00-01": ["informe_final.xlsx"]},
+    )
+    assert any(v.get("verificacion") == "B2" and v.get("confianza") == "alta" for v in informe["violaciones"])
+    despues = modulo.anexar_entradas_no_entregadas(lab, informe, is_spanish=True)
+    assert "informe_final.xlsx" in despues
+    assert "Anexo (datos ficticios)" in despues
+
+
+def test_a2e_nombre_sin_etiqueta_se_bloquea_y_se_repara():
+    """An unlabeled company and country in the syllabus are locked like labeled ones."""
+    temario = "CIBEST CAPITAL opera desde El Salvador con seis fondos."
+    lab = (
+        "## Descripción General\n"
+        "En el contexto de Northstar Digital, el escenario se sitúa en Spain.\n\n"
+        "### Paso 1: Revisar\n"
+        "1. Abra el comparativo.\n"
+    )
+    nombres = {e["rol"]: e["nombre"] for e in extraer_anclajes(temario)["entidades"]}
+    assert nombres.get("organizacion") == "CIBEST CAPITAL"
+    assert nombres.get("lugar") == "El Salvador"
+    informe = auditar_laboratorio(lab, temario, temario=temario)
+    hallazgos = _a2e(informe)
+    assert hallazgos, hallazgos
+    assert any(h["confianza"] == "alta" for h in hallazgos)
+    reparada = reparar_anclajes_en_guia(lab, temario)
+    assert "CIBEST CAPITAL" in reparada
+    assert "El Salvador" in reparada
+
+
+def test_b5_compara_el_sistema_con_el_temario():
+    """An OS the plan invented still fails when the syllabus names another one."""
+    temario = "La práctica se hace en Windows."
+    lab = (
+        "## Entorno\n"
+        "Requisitos: instale Ubuntu y ejecute los comandos siguientes.\n\n"
+        "### Paso 1: Instalar\n"
+        "1. Instale Ubuntu.\n"
+    )
+    plan = "software: Ubuntu 22.04"
+    informe = auditar_requisitos(lab, plan, temario=temario)
+    assert any(item["tipo"] == "os_temario" for item in informe["contradicciones"]), informe
+    reparada = reparar_requisitos_contra_temario(lab, temario)
+    assert "Ubuntu" not in reparada
+    assert "Windows" in reparada or "windows" in reparada.lower()
+    sin_so = "La práctica usa el navegador."
+    solo_aviso = auditar_requisitos(lab, plan, temario=sin_so)
+    assert any(item["tipo"] == "os_temario" for item in solo_aviso["ampliaciones"])
+    assert solo_aviso["contradicciones"] == [] or all(
+        item["tipo"] != "os_temario" for item in solo_aviso["contradicciones"]
+    )
+
+
+def test_b5_senala_una_herramienta_que_el_temario_no_nombra():
+    temario = "Use el navegador de Microsoft 365."
+    lab = (
+        "## Entorno\n"
+        "Requisitos: abra PowerShell y ejecute el script.\n\n"
+        "### Paso 1: Ejecutar\n"
+        "1. Abra PowerShell.\n"
+    )
+    informe = auditar_requisitos(lab, "Windows", temario=temario)
+    assert any(item["tipo"] == "herramienta_temario" for item in informe["ampliaciones"]), informe
 
 
 if __name__ == "__main__":

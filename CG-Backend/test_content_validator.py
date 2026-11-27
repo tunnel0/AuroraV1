@@ -17,13 +17,22 @@ import os
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_RUTA_VALIDADOR = os.path.join(_HERE, "lambda", "content_validator", "content_validator.py")
+_DIR_VALIDADOR = os.path.join(_HERE, "lambda", "content_validator")
+_RUTA_VALIDADOR = os.path.join(_DIR_VALIDADOR, "content_validator.py")
 _RUTA_MAQUINA = os.path.join(_HERE, "current_state_machine.json")
 
 
 def _cargar_validador():
     # El modulo crea un cliente S3 al importarse; la bateria no debe tocar AWS.
     import boto3
+
+    # CodeUri is content_validator/. A combined session may already have imported
+    # the writer's copy of these siblings under the same module name.
+    for nombre in ("measurable_evidence", "markdown_repair"):
+        sys.modules.pop(nombre, None)
+    if _DIR_VALIDADOR in sys.path:
+        sys.path.remove(_DIR_VALIDADOR)
+    sys.path.insert(0, _DIR_VALIDADOR)
 
     original = boto3.client
     boto3.client = lambda *a, **k: object()
@@ -256,19 +265,98 @@ def test_el_handler_devuelve_all_valid_y_falla_si_se_le_pide():
     assert salida["statusCode"] == 200, salida
     assert salida["all_valid"] is False
     assert salida["total_errors"] == 1
+    assert salida["invalid_lab_ids"] == ["01-00-01"]
 
     estricto = modulo.lambda_handler(dict(evento, fail_on_error=True), None)
     assert estricto["statusCode"] == 400
 
 
+def test_la_validacion_no_medible_avisa_sobre_frases_vagas():
+    lab = _LAB_COMPLETO + "\nLa solución funciona correctamente en todos los escenarios.\n"
+    informe = cv.ContentValidator().validate_lab(lab)
+    assert "unmeasurable_validation" in _reglas(informe, cv.ValidationSeverity.WARNING)
+
+
+def test_la_validacion_no_medible_avisa_sobre_secretos_inventados():
+    lab = _LAB_COMPLETO.replace(
+        "pip install",
+        "export PGPASSWORD=pg_password_123 && pip install",
+    )
+    informe = cv.ContentValidator().validate_lab(lab)
+    assert "unmeasurable_validation" in _reglas(informe, cv.ValidationSeverity.WARNING)
+
+
+def test_las_vallas_y_visual_se_reparan_antes_del_aviso():
+    import markdown_repair as repair
+
+    bruto = "\n".join([
+        "```",
+        "Get-ChildItem",
+        "```",
+        "```",
+        "echo hola",
+        "```",
+        "```",
+        '{"clave": 1}',
+        "```",
+        "```",
+        "notas del instructor",
+        "```",
+        "```bash",
+        "ls",
+        "```",
+        "[visual: 01-01-0001 - diagrama de la arquitectura]",
+        "[Visual:01-01-0002 - otro diagrama del flujo]",
+        "[VISUAL: 01-01-0003 - diagrama que ya estaba bien]",
+    ])
+    listo = repair.reparar_markdown(bruto)
+    assert "```powershell" in listo
+    assert "```bash" in listo
+    assert "```json" in listo
+    assert "```text" in listo
+    assert listo.count("```bash") == 2
+    assert "[visual:" not in listo
+    assert "[Visual:" not in listo
+    assert "[VISUAL: 01-01-0001 - diagrama de la arquitectura]" in listo
+    assert "[VISUAL: 01-01-0002 - otro diagrama del flujo]" in listo
+    assert "[VISUAL: 01-01-0003 - diagrama que ya estaba bien]" in listo
+    informe = cv.ContentValidator().validate_lesson("# Leccion\n\n" + listo)
+    assert "code_block_language" not in [w.rule for w in informe.warnings]
+    assert not any("Lowercase" in w.message for w in informe.warnings)
+    previo = os.environ.get("MARKDOWN_REPAIR")
+    os.environ["MARKDOWN_REPAIR"] = "0"
+    try:
+        assert repair.reparar_markdown(bruto) == bruto
+    finally:
+        if previo is None:
+            os.environ.pop("MARKDOWN_REPAIR", None)
+        else:
+            os.environ["MARKDOWN_REPAIR"] = previo
+
+
+def test_las_copias_de_markdown_repair_son_identicas():
+    origen = os.path.join(_HERE, "lambda", "markdown_repair.py")
+    copias = [
+        os.path.join(_HERE, "lambda", "content_validator", "markdown_repair.py"),
+        os.path.join(_HERE, "lambda", "strands_lab_writer", "markdown_repair.py"),
+        os.path.join(_HERE, "lambda", "strands_content_gen", "markdown_repair.py"),
+    ]
+    with open(origen, encoding="utf-8") as fichero:
+        canon = fichero.read()
+    for ruta in copias:
+        with open(ruta, encoding="utf-8") as fichero:
+            assert fichero.read() == canon, ruta
+
+
 def test_el_estado_desplegado_consume_all_valid():
-    """La puerta no sirve si el `all_valid` del validador no lo lee ningun `Choice`."""
+    """all_valid=false regenerates once, then the book is still built."""
     with open(_RUTA_MAQUINA, encoding="utf-8") as f:
         maquina = json.load(f)
     estados = maquina["States"]
 
     for nombre in ("ValidateLabContent", "ValidateLabContentBoth"):
         assert estados[nombre]["Next"] == "CheckLabValidation", nombre
+        assert estados[nombre]["ResultSelector"]["invalid_lab_ids.$"] == "$.Payload.invalid_lab_ids"
 
     puerta = estados["CheckLabValidation"]
     assert puerta["Type"] == "Choice"
@@ -277,18 +365,19 @@ def test_el_estado_desplegado_consume_all_valid():
     sombra = [c for c in puerta["Choices"] if c.get("Variable") == "$.lab_validation_shadow"]
     assert sombra and sombra[0]["IsPresent"] is True
 
-    bloqueo = [
+    regenera = [
         c
         for c in puerta["Choices"]
-        if c.get("Next") == "NotifyFailure"
+        if c.get("Next") == "CountInvalidLabs"
         and any(
             cond.get("Variable") == "$.lab_validation_result.all_valid"
             and cond.get("BooleanEquals") is False
             for cond in c.get("And", [])
         )
     ]
-    assert bloqueo, "no hay rama que bloquee cuando all_valid es false"
-    assert "NotifyFailure" in estados
+    assert regenera, "no hay rama que regenere cuando all_valid es false"
+    assert estados["RecordStructuralWarning"]["Next"] == "InvokeLabGuideBuilder"
+    assert "FailLabQualityGate" not in estados
 
 
 def _ejecutar():

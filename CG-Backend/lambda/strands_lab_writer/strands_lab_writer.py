@@ -22,7 +22,17 @@ from botocore.exceptions import ClientError
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
+from markdown_repair import reparar_markdown
+from optional_fields import normalizar_evento_writer
+from copilot_currency import (
+    auditar_superficies_copilot,
+    construir_informe_moneda,
+    mensaje_de_correccion_moneda,
+    texto_de_catalogo_para_prompt,
+)
 from manual_context import select_manual_context, flatten_to_text
+from audience_adaptation import adjust_presupuesto, writer_audience_block
+from golden_lab_example import build_golden_lab_prompt_section
 from referent_check import (
     auditar_laboratorio,
     duracion_declarada,
@@ -30,10 +40,26 @@ from referent_check import (
     mensaje_de_correccion,
     presupuesto_de_duracion,
     referencias_a_labs_posteriores,
-    referentes_creados,
     requisitos_declarados,
     salidas_de_laboratorios,
+    texto_de_anclajes,
+    reparar_anclajes_en_guia,
+    reparar_requisitos_contra_temario,
 )
+from measurable_evidence import (
+    hallazgos_validacion_no_medible,
+    mensaje_correccion_validacion,
+    reparar_validacion_no_medible,
+)
+from reading_budget import (
+    hallazgo_lectura,
+    medir_lectura,
+    mensaje_acortar,
+    recortar_a_presupuesto,
+    reintento_habilitado as _reintento_lectura_habilitado,
+    texto_para_prompt as _texto_presupuesto_lectura,
+)
+from bedrock_fallback import fallback_model_ids, run_model_chain
 
 # Bedrock client: read_timeout must stay below Lambda timeout (900s) but high enough
 # that boto3 does not abort a long generation and retry (which doubles wall time).
@@ -89,6 +115,20 @@ def _reintento_entorno_habilitado() -> bool:
     )
 
 
+def _reintento_validacion_medible_habilitado() -> bool:
+    """``VALIDATION_EVIDENCE_RETRY=0`` deja la validación medible en solo registro."""
+    return os.getenv("VALIDATION_EVIDENCE_RETRY", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _reintento_moneda_habilitado() -> bool:
+    """C6 Copilot currency. ``CURRENCY_RETRY=0`` records the finding and ships the lab."""
+    return os.getenv("CURRENCY_RETRY", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
 def _reintento_entregables_habilitado() -> bool:
     """Interruptor operativo propio de B3p: **apagado por defecto**.
 
@@ -100,6 +140,100 @@ def _reintento_entregables_habilitado() -> bool:
     return os.getenv("DELIVERABLES_RETRY", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
+
+
+def _ficha_de_hallazgo(violacion: dict) -> dict:
+    """Short, log-safe copy of one finding. The full object stays in the S3 report."""
+    return {
+        "verificacion": violacion.get("verificacion") or "B1",
+        "confianza": violacion.get("confianza") or "baja",
+        "valor": str(violacion.get("valor") or "")[:300],
+    }
+
+
+def partir_hallazgos(violaciones) -> tuple:
+    """Split findings into a blocking set and warnings.
+
+    High confidence (``confianza == "alta"``) blocks delivery after the final
+    retry: syllabus quantity (A2), duration (B6), objective (A5), undeclared
+    files (B1/B2), environment (C2), file-shaped omissions (B3p) and any other
+    high-confidence validator finding. Medium confidence (a reading-budget
+    overrun that survived the last attempt) and low confidence stay warnings.
+    """
+    bloquean: List[dict] = []
+    advertencias: List[dict] = []
+    for violacion in violaciones or ():
+        if not isinstance(violacion, dict):
+            continue
+        ficha = _ficha_de_hallazgo(violacion)
+        if ficha["confianza"] == "alta":
+            bloquean.append(ficha)
+        else:
+            advertencias.append(ficha)
+    return bloquean, advertencias
+
+
+def hallazgo_objetivo_ausente(markdown: str, lab_plan: dict) -> Optional[dict]:
+    """A5: the syllabus objective must still be in the guide we are about to save.
+
+    ``asegurar_objetivo_declarado`` inserts it when the objectives section exists.
+    If that insert cannot run, the mismatch is a high-confidence finding.
+    """
+    objetivo = " ".join(str((lab_plan or {}).get("outline_objective") or "").split())
+    if not objetivo:
+        return None
+    if _sin_marcas(objetivo) in _sin_marcas(markdown or ""):
+        return None
+    return {
+        "valor": f"objetivo del temario ausente o reescrito: {objetivo[:180]}",
+        "tipo": "objetivo",
+        "inicio": 0,
+        "confianza": "alta",
+        "verificacion": "A5",
+    }
+
+
+def resumir_hallazgos(bloquean, prefijo: str = "NEEDS_REVIEW") -> str:
+    """One string the state machine can put in the execution cause."""
+    if not bloquean:
+        return "passed"
+    partes = []
+    for hallazgo in list(bloquean)[:12]:
+        if isinstance(hallazgo, dict) and "findings" in hallazgo:
+            lab_id = hallazgo.get("lab_id") or "?"
+            for ficha in (hallazgo.get("findings") or [])[:4]:
+                partes.append(
+                    f"{lab_id} {ficha.get('verificacion')}: {str(ficha.get('valor') or '')[:160]}"
+                )
+        else:
+            partes.append(
+                f"{hallazgo.get('verificacion')}: {str(hallazgo.get('valor') or '')[:160]}"
+            )
+    texto = prefijo + " " + "; ".join(partes)
+    return texto[:1800]
+
+
+def _registrar_puerta_de_lab(lab_id: str, attempt: int, bloquean, advertencias) -> None:
+    """Logs the gate decision. High confidence is not a silent accept."""
+    if bloquean:
+        print(
+            f"  🚫 QUALITY GATE: lab {lab_id} needs_review after attempt "
+            f"{attempt}/{MAX_LAB_GENERATION_ATTEMPTS}. "
+            f"{len(bloquean)} high-confidence finding(s) remain. "
+            f"The lab still ships; the finding is a warning on the quality report."
+        )
+        for ficha in bloquean[:12]:
+            print(f"     🚫 {ficha['verificacion']} [{ficha['confianza']}] {ficha['valor']}")
+        return
+    if advertencias:
+        print(
+            f"  ⚠️  QUALITY GATE: lab {lab_id} passed with "
+            f"{len(advertencias)} non-blocking warning(s)."
+        )
+        for ficha in advertencias[:8]:
+            print(f"     ⚠️  {ficha['verificacion']} [{ficha['confianza']}] {ficha['valor']}")
+        return
+    print(f"  ✅ QUALITY GATE: lab {lab_id} passed")
 
 # App-level Bedrock invoke retries inside call_bedrock_agent
 BEDROCK_APP_MAX_ATTEMPTS = max(1, int(os.getenv("BEDROCK_APP_MAX_ATTEMPTS", "5")))
@@ -472,48 +606,147 @@ def load_lesson_content(bucket: str, key: str) -> str:
 
 
 
-def call_bedrock_agent(prompt: str, model_id: str) -> str:
-    """Call AWS Bedrock with Strands Agents pattern and transient-error backoff."""
+# Model id that actually produced the last successful completion in this process.
+_modelo_que_respondio: dict = {"id": None}
+
+MARCA_PLACEHOLDER = "AURORA_PLACEHOLDER_PENDING_REGENERATION"
+
+
+def modelo_que_produjo_el_lab() -> Optional[str]:
+    return _modelo_que_respondio.get("id")
+
+
+def _invoke_bedrock_once(prompt: str, model_id: str) -> str:
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": LAB_BEDROCK_MAX_OUTPUT_TOKENS,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        "temperature": 0.7
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
     }
-    last_err: Optional[Exception] = None
-    for attempt in range(1, BEDROCK_APP_MAX_ATTEMPTS + 1):
-        try:
-            response = bedrock_client.invoke_model(
-                modelId=model_id,
-                body=json.dumps(payload),
-                contentType='application/json',
-                accept='application/json'
-            )
-            response_body = json.loads(response['body'].read())
-            blocks = response_body.get("content") or []
-            if not blocks:
-                print(f"⚠️ Bedrock empty content[]; keys={list(response_body.keys())}")
-                raise ValueError("Bedrock returned no content blocks")
-            text = blocks[0].get("text") or ""
-            if not (text or "").strip():
-                sr = response_body.get("stop_reason")
-                print(f"⚠️ Bedrock empty text; stop_reason={sr!r} body_keys={list(response_body.keys())}")
-                raise ValueError(f"Bedrock returned empty assistant text (stop_reason={sr!r})")
+    response = bedrock_client.invoke_model(
+        modelId=model_id,
+        body=json.dumps(payload),
+        contentType="application/json",
+        accept="application/json",
+    )
+    response_body = json.loads(response["body"].read())
+    blocks = response_body.get("content") or []
+    if not blocks:
+        print(f"⚠️ Bedrock empty content[]; keys={list(response_body.keys())}")
+        raise ValueError("Bedrock returned no content blocks")
+    text = blocks[0].get("text") or ""
+    if not (text or "").strip():
+        sr = response_body.get("stop_reason")
+        print(f"⚠️ Bedrock empty text; stop_reason={sr!r} body_keys={list(response_body.keys())}")
+        raise ValueError(f"Bedrock returned empty assistant text (stop_reason={sr!r})")
+    return text
+
+
+def _respaldo_openai_o_gemini(prompt: str) -> Optional[str]:
+    """Existing OpenAI, then Gemini, only when a secret or env key is configured."""
+    try:
+        secret_data = get_secret("aurora/openai-api-key")
+        api_key = (secret_data or {}).get("api_key") or os.environ.get("OPENAI_API_KEY")
+        if api_key:
+            print("🔄 Bedrock exhausted. Trying OpenAI.")
+            text = call_openai_agent(prompt, api_key, DEFAULT_OPENAI_MODEL)
+            _modelo_que_respondio["id"] = DEFAULT_OPENAI_MODEL
             return text
-        except Exception as e:
-            last_err = e
-            print(f"❌ Bedrock API error (attempt {attempt}/{BEDROCK_APP_MAX_ATTEMPTS}): {e}")
-            if attempt < BEDROCK_APP_MAX_ATTEMPTS and _bedrock_error_is_transient(e):
-                _sleep_before_bedrock_retry(attempt - 1)
-                continue
-            raise
-    assert last_err is not None
-    raise last_err
+    except Exception as exc:
+        print(f"⚠️ OpenAI fallback unavailable: {exc}")
+    try:
+        google_key = get_google_api_key()
+        if google_key:
+            print("🔄 Bedrock exhausted. Trying Gemini.")
+            text = call_gemini_agent(prompt, google_key)
+            _modelo_que_respondio["id"] = "gemini"
+            return text
+    except Exception as exc:
+        print(f"⚠️ Gemini fallback unavailable: {exc}")
+    return None
+
+
+def call_bedrock_agent(prompt: str, model_id: str) -> str:
+    """Bedrock with per-minute backoff, then the fallback model chain.
+
+    A daily token quota, ServiceQuotaExceeded, AccessDenied, or throttling
+    that continues after backoff switches immediately to the next model in
+    ``BEDROCK_FALLBACK_MODELS``. OpenAI and Gemini run only when a key exists.
+    """
+    try:
+        text, used = run_model_chain(
+            lambda mid: _invoke_bedrock_once(prompt, mid),
+            fallback_model_ids(model_id),
+            max_attempts=BEDROCK_APP_MAX_ATTEMPTS,
+            sleep=_sleep_before_bedrock_retry,
+            is_transient=_bedrock_error_is_transient,
+        )
+        _modelo_que_respondio["id"] = used
+        if used != model_id:
+            print(f"🔄 Bedrock answered with fallback model {used}")
+        return text
+    except Exception as bedrock_err:
+        print(f"❌ Bedrock model chain failed: {bedrock_err}")
+        alterno = _respaldo_openai_o_gemini(prompt)
+        if alterno:
+            return alterno
+        raise
+
+
+def markdown_de_laboratorio_pendiente(lab_id: str, titulo: str, motivo: str = "") -> str:
+    """Bilingual placeholder. Spanish first. The run continues; this lab is regenerated later."""
+    titulo = (titulo or lab_id or "laboratorio").strip()
+    detalle = (motivo or "error de generación").strip()[:500]
+    return f"""# Lab {lab_id}: {titulo}
+
+> **PENDIENTE DE REGENERACIÓN / PENDING REGENERATION**
+>
+> Este laboratorio no pudo generarse en este intento y queda pendiente de regeneración.
+> This lab could not be generated on this attempt and is pending regeneration.
+>
+> No use este texto como instrucción de práctica.
+> Do not use this text as lab instructions.
+>
+> Motivo / Reason: {detalle}
+
+<!-- {MARCA_PLACEHOLDER} -->
+
+## Descripción general / Overview
+
+Contenido pendiente de regeneración. / Content pending regeneration.
+
+## Objetivos de aprendizaje / Learning objectives
+
+- [ ] Pendiente de regeneración. / Pending regeneration.
+
+## Instrucciones paso a paso / Step-by-step instructions
+
+### Paso 1: Pendiente / Step 1: Pending
+
+**Objetivo / Objective:** Regenerar este laboratorio. / Regenerate this lab.
+
+**Instrucciones / Instructions:**
+
+1. Este paso es un marcador. No lo ejecute. / This step is a marker. Do not run it.
+
+**Resultado esperado / Expected output:** Un laboratorio regenerado. / A regenerated lab.
+
+**Verificación / Verification:** El archivo ya no contiene la marca de pendiente. / The file no longer contains the pending marker.
+"""
+
+
+def put_object_con_reintento(intentos: int = 3, **kwargs):
+    """Retry an S3 put. Return the error instead of raising after the last try."""
+    ultimo = None
+    for intento in range(1, max(1, intentos) + 1):
+        try:
+            return s3_client.put_object(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - the caller records the failure and continues
+            ultimo = exc
+            print(f"⚠️ S3 put attempt {intento}/{intentos} failed: {exc}")
+            if intento < intentos:
+                time.sleep(min(2.0, 0.2 * intento))
+    return ultimo
 
 
 def call_openai_agent(prompt: str, api_key: str, model_id: str = DEFAULT_OPENAI_MODEL) -> str:
@@ -556,7 +789,7 @@ THOR_QUALITY_RULES = """THOR QUALITY RULES (MANDATORY - informe de mejoras):
 3. LICENCIAS Y HERRAMIENTAS: Differentiate Microsoft 365 Copilot, Copilot Chat, Designer, Planner and similar tools, stating the license and configuration for each.
 4. DURACIÓN: Keep each lab within the time and complexity defined by the syllabus; for a 90-minute seminar prioritize effective tool usage.
 5. DEPENDENCIAS: Reduce auxiliary files/dependencies; embed in the prompts any information that does not require an external file. Provide controlled scenarios, inputs and sources so results are comparable.
-6. VALIDACIÓN MEDIBLE: Define measurable criteria and sufficient evidence (command, file, output, screenshot). Do NOT claim production-ready from five generic tests or a 60% success rate.
+6. VALIDACIÓN MEDIBLE: Define measurable criteria and sufficient evidence (command, file, output, screenshot). For Copilot/LLM steps, Expected output must be a bullet list of required elements or sections—never a verbatim paragraph the model might return; omit Expected output when Verification already lists those checks. Do NOT claim production-ready from five generic tests, vague success rates, or invented passwords/paths.
 7. LIMITACIONES DE IA: In Validation & Testing include at least one adversarial case: nonexistent/contradictory information, missing evidence, or instructions embedded in documents (prompt injection).
 8. PROMPTING: Evaluate precision, traceability, uncertainty, usefulness and human supervision; do NOT require exposing internal reasoning as a success criterion.
 9. PEDAGOGÍA: Favor experimentation and reinforcement over documentation/captures.
@@ -1042,11 +1275,16 @@ def save_lab_guide_to_s3(
         
         filename = f"lab-{lab_id}-{safe_title}.md"
         key = f"{project_folder}/labguide/{filename}"
-        
+        try:
+            cuerpo = reparar_markdown(lab_guide)
+        except Exception as repair_exc:
+            print(f"    ⚠️ Markdown repair skipped for {lab_id}: {repair_exc}")
+            cuerpo = lab_guide
+
         s3_client.put_object(
             Bucket=bucket,
             Key=key,
-            Body=lab_guide.encode('utf-8'),
+            Body=cuerpo.encode('utf-8'),
             ContentType='text/markdown'
         )
         
@@ -1056,6 +1294,74 @@ def save_lab_guide_to_s3(
     except Exception as e:
         print(f"    ❌ Error saving lab guide: {e}")
         raise
+
+
+def _guardar_guia_con_reintento(
+    bucket: str,
+    project_folder: str,
+    lab_id: str,
+    lab_title: str,
+    lab_guide: str,
+    intentos: int = 3,
+) -> str:
+    """Retry the S3 write. An empty string means the lab was reported, not raised."""
+    for intento in range(1, max(1, intentos) + 1):
+        try:
+            return save_lab_guide_to_s3(
+                bucket=bucket,
+                project_folder=project_folder,
+                lab_id=lab_id,
+                lab_title=lab_title,
+                lab_guide=lab_guide,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"    ⚠️ Save retry {intento}/{intentos} for {lab_id}: {exc}")
+            if intento < intentos:
+                time.sleep(min(2.0, 0.2 * intento))
+    return ""
+
+
+def _entregar_placeholders_tras_fallo(event: dict, exc: Exception) -> Optional[dict]:
+    """If the handler crashes after the lab ids are known, still return a placeholder batch."""
+    if not isinstance(event, dict):
+        return None
+    ids = [lab for lab in (event.get("lab_ids") or []) if lab]
+    bucket = event.get("course_bucket")
+    project = event.get("project_folder")
+    if not ids or not bucket or not project:
+        return None
+    motivo = str(exc)[:500]
+    keys = []
+    avisos = []
+    for lab_id in ids:
+        texto = markdown_de_laboratorio_pendiente(lab_id, lab_id, motivo)
+        key = _guardar_guia_con_reintento(bucket, project, lab_id, lab_id, texto)
+        if key:
+            keys.append(key)
+        avisos.append(
+            {
+                "lab_id": lab_id,
+                "findings": [
+                    {"verificacion": "PLACEHOLDER", "confianza": "media", "valor": motivo[:300]}
+                ],
+            }
+        )
+    print(f"⚠️ Returning {len(keys)} placeholder lab(s) after {type(exc).__name__}")
+    return {
+        "statusCode": 200,
+        "lab_guides_generated": len(keys),
+        "lab_guide_keys": keys,
+        "project_folder": project,
+        "bucket": bucket,
+        "model_provider": event.get("model_provider") or "bedrock",
+        "quality_status": "placeholder",
+        "quality_summary": "PENDIENTE DE REGENERACIÓN / PENDING REGENERATION",
+        "labs_needing_review": [],
+        "quality_warnings": avisos,
+        "placeholders": [{"lab_id": lab_id, "reason": motivo} for lab_id in ids],
+        "failed_lab_ids": list(ids),
+        "models_used": {},
+    }
 
 
 def _strip_outer_markdown_fence(text: str) -> str:
@@ -1141,63 +1447,197 @@ Use specific commands, configurations, and concepts from this lesson where appli
 """
 
 
-def _referentes_creados_en_labs_anteriores(
-    bucket: str, project_folder: str, lab_ids_anteriores: list[str]
-) -> set[str]:
-    """Claves de los ficheros que crearon los laboratorios previos (verificación B3c).
-
-    Es el contexto que le faltaba a B1: un fichero creado en el laboratorio 2 es
-    legítimo en el 3. Se leen de S3, no del plan, porque lo que cuenta es lo que se
-    **escribió**, no lo que el plan prometió. Los lotes se ejecutan en secuencia y de
-    uno en uno (``MaxConcurrency: 1``), así que los laboratorios previos ya están
-    guardados cuando se escribe el actual.
-    """
-    creados: set[str] = set()
-    for lab_id in lab_ids_anteriores or ():
-        key = _find_existing_lab_guide_key(bucket, project_folder, lab_id)
-        if not key:
-            continue
-        try:
-            cuerpo = (
-                s3_client.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
-            )
-        except Exception as e:
-            print(f"⚠️  No se pudo leer el laboratorio anterior {lab_id} para B3c: {e}")
-            continue
-        creados |= referentes_creados(cuerpo)
-    return creados
-
-
 def _get_previous_lab_context(bucket: str, project_folder: str, prev_lab_id: str) -> str:
-    """Fetch previous lab markdown from S3 and extract code blocks/context for sequential continuity."""
-    if not prev_lab_id:
-        return ""
-    key = _find_existing_lab_guide_key(bucket, project_folder, prev_lab_id)
-    if not key:
-        return ""
-    try:
-        obj = s3_client.get_object(Bucket=bucket, Key=key)
-        content = obj['Body'].read().decode('utf-8')
-        code_blocks = re.findall(r'```(?:bash|sh|python|sql|yaml|json)?\n(.*?)```', content, re.DOTALL)
-        code_summary = "\n".join(cb.strip() for cb in code_blocks if cb.strip())[:3000]
-        if not code_summary.strip():
-            code_summary = content[:2000]
-        return f"""
-═══════════════════════════════════════════════════════════════════════════════
-CONTEXT FROM PREVIOUS LAB (Lab {prev_lab_id}):
-═══════════════════════════════════════════════════════════════════════════════
-The student previously completed Lab {prev_lab_id} using the following commands and code:
+    """Do not inject the previous lab. Each practice must run alone.
 
-{code_summary}
+    The live prompt used to paste the previous guide and order the model to reuse
+    its files, database names, ports and directories. That instruction is gone:
+    a student opening only this chapter must not need the previous one.
+    The arguments stay so older callers keep a stable signature.
+    """
+    del bucket, project_folder, prev_lab_id
+    return ""
 
-IMPORTANT CONTINUITY RULES:
-- Reuse the EXACT same database names, container names, usernames, ports, and directory structures established in Lab {prev_lab_id}.
-- Do NOT re-create entities that already exist unless explicitly modifying or extending them.
-═══════════════════════════════════════════════════════════════════════════════
-"""
-    except Exception as e:
-        print(f"⚠️ Could not load previous lab context for {prev_lab_id}: {e}")
+
+# Office, mail and tabular inputs the student cannot invent. A lab that names
+# one of these without a source gets an inline fictitious annex.
+_EXTENSIONES_ANEXO = frozenset(
+    {"xlsx", "xlsm", "xls", "csv", "tsv", "docx", "doc", "eml"}
+)
+_TITULO_ANEXO_ES = "Anexo (datos ficticios)"
+_TITULO_ANEXO_EN = "Annex (fictitious data)"
+
+
+def _extension_de_entrada(nombre: str) -> str:
+    base = os.path.basename((nombre or "").replace("\\", "/").rstrip("/"))
+    if "." not in base:
         return ""
+    return base.rsplit(".", 1)[-1].lower()
+
+
+def _entradas_para_anexo(informe: dict) -> list[str]:
+    """High-confidence file inputs this chapter must carry itself.
+
+    Excel, Word, ``.eml``, CSV and SharePoint ``/sites/`` paths. B1 is a file
+    the syllabus never delivers. B2 is a file a later lab produces; with
+    ``ANNEX_FORWARD`` (default on) that file is inlined here too, so the lab
+    still runs alone. ``ANNEX_FORWARD=0`` keeps B1 only.
+    """
+    admitidas = {"B1"}
+    if os.environ.get("ANNEX_FORWARD", "1") != "0":
+        admitidas.add("B2")
+    vistos: list[str] = []
+    claves: set[str] = set()
+    for hallazgo in (informe or {}).get("violaciones") or []:
+        if hallazgo.get("verificacion") not in admitidas or hallazgo.get("confianza") != "alta":
+            continue
+        valor = str(hallazgo.get("valor") or "").strip().rstrip(".,;:")
+        if not valor:
+            continue
+        ruta = valor.replace("\\", "/")
+        base = os.path.basename(ruta.rstrip("/")) or ruta
+        extension = _extension_de_entrada(base)
+        sharepoint = "/sites/" in ruta.lower()
+        if extension not in _EXTENSIONES_ANEXO and not sharepoint:
+            continue
+        objetivo = base if extension in _EXTENSIONES_ANEXO else ruta
+        clave = objetivo.lower()
+        if clave in claves:
+            continue
+        claves.add(clave)
+        vistos.append(objetivo)
+    return vistos
+
+
+def _cuerpo_ficticio(nombre: str, is_spanish: bool) -> str:
+    """Inline fictitious payload. No extra filenames, so the annex adds no new dependency."""
+    extension = _extension_de_entrada(nombre)
+    if extension in {"csv", "tsv"}:
+        separador = "\t" if extension == "tsv" else ","
+        columnas = (
+            ["region", "producto", "unidades"]
+            if is_spanish
+            else ["region", "product", "units"]
+        )
+        filas = [
+            separador.join(columnas),
+            separador.join(["Norte" if is_spanish else "North", "Alfa", "120"]),
+            separador.join(["Sur" if is_spanish else "South", "Beta", "80"]),
+        ]
+        return "```" + extension + "\n" + "\n".join(filas) + "\n```\n"
+    if extension in {"xlsx", "xlsm", "xls"}:
+        if is_spanish:
+            return (
+                "| region | producto | unidades |\n"
+                "| --- | --- | --- |\n"
+                "| Norte | Alfa | 120 |\n"
+                "| Sur | Beta | 80 |\n"
+            )
+        return (
+            "| region | product | units |\n"
+            "| --- | --- | --- |\n"
+            "| North | Alfa | 120 |\n"
+            "| South | Beta | 80 |\n"
+        )
+    if extension in {"docx", "doc"}:
+        if is_spanish:
+            return (
+                "Titulo: Nota interna de practica\n\n"
+                "Este documento es ficticio. Describe un pedido de ejemplo de 120 unidades "
+                "y una conclusion breve para que los resultados se puedan comparar.\n"
+            )
+        return (
+            "Title: Internal practice note\n\n"
+            "This document is fictitious. It describes a sample order of 120 units "
+            "and a short conclusion so results stay comparable.\n"
+        )
+    if extension == "eml":
+        if is_spanish:
+            mensaje = (
+                "From: aviso@ejemplo.test\n"
+                "To: alumno@ejemplo.test\n"
+                "Subject: Caso de practica\n"
+                "Date: Mon, 1 Jan 2024 09:00:00 +0000\n"
+                "MIME-Version: 1.0\n"
+                "Content-Type: text/plain; charset=utf-8\n"
+                "\n"
+                "Este mensaje es ficticio. El pedido de ejemplo tiene 120 unidades.\n"
+            )
+        else:
+            mensaje = (
+                "From: notice@example.test\n"
+                "To: student@example.test\n"
+                "Subject: Practice case\n"
+                "Date: Mon, 1 Jan 2024 09:00:00 +0000\n"
+                "MIME-Version: 1.0\n"
+                "Content-Type: text/plain; charset=utf-8\n"
+                "\n"
+                "This message is fictitious. The sample order is 120 units.\n"
+            )
+        return "```text\n" + mensaje + "```\n"
+    if is_spanish:
+        return (
+            "Inventario ficticio del sitio:\n\n"
+            "- Elemento Alfa: 120 unidades\n"
+            "- Elemento Beta: 80 unidades\n"
+        )
+    return (
+        "Fictitious site inventory:\n\n"
+        "- Item Alfa: 120 units\n"
+        "- Item Beta: 80 units\n"
+    )
+
+
+def _seccion_anexo(nombre: str, is_spanish: bool) -> str:
+    mostrado = (nombre or "").replace("`", "").strip()
+    cuerpo = _cuerpo_ficticio(mostrado, is_spanish)
+    if is_spanish:
+        intro = (
+            f"Guarde el archivo `{mostrado}` con el contenido siguiente. "
+            "Los datos son ficticios y bastan para ejecutar esta práctica sin archivos externos."
+        )
+    else:
+        intro = (
+            f"Save the file `{mostrado}` with the following content. "
+            "The data is fictitious and is enough to run this practice with no external files."
+        )
+    # `cat >` is already a creation mark, so the annex counts as delivered in
+    # this lab for both Spanish (``guarde``) and English guides.
+    return f"### {mostrado}\n\n{intro}\n\ncat > {mostrado}\n\n{cuerpo}"
+
+
+def anexar_entradas_no_entregadas(
+    markdown: str, informe: dict, is_spanish: bool = True
+) -> str:
+    """Inline fictitious annexes for input files this lab needs and nobody delivered.
+
+    The heading is ``Anexo (datos ficticios)`` in Spanish guides. A file already
+    present under that heading is left as it is.
+    """
+    pendientes = [
+        nombre
+        for nombre in _entradas_para_anexo(informe)
+        if f"### {nombre}" not in (markdown or "")
+    ]
+    if not pendientes:
+        return markdown
+    titulo = _TITULO_ANEXO_ES if is_spanish else _TITULO_ANEXO_EN
+    bloques = "".join(_seccion_anexo(nombre, is_spanish) for nombre in pendientes)
+    if titulo in (markdown or ""):
+        return (markdown or "").rstrip() + "\n\n" + bloques
+    if is_spanish:
+        intro = (
+            f"## {titulo}\n\n"
+            "Este anexo contiene datos ficticios para que la práctica se ejecute sola, "
+            "sin archivos de un laboratorio anterior ni contenido de SharePoint.\n\n"
+        )
+    else:
+        intro = (
+            f"## {titulo}\n\n"
+            "This annex holds fictitious data so the practice runs on its own, "
+            "without files from a previous lab or SharePoint content.\n\n"
+        )
+    return (markdown or "").rstrip() + "\n\n" + intro + bloques
 
 
 def _verify_and_refine_lab_guide(
@@ -1237,8 +1677,9 @@ LAB GUIDE CONTENT TO FIX:
 {lab_guide[:12000]}
 
 REQUIREMENTS:
-- Replace all generic placeholders (like <YOUR_PASSWORD> or [INSERT HERE]) with real, explicit, production-ready values (e.g. `pg_password_123`, `/var/lib/app`).
-- Ensure all command syntax is valid and executable.
+- Replace generic placeholders (e.g. <YOUR_PASSWORD>, [INSERT HERE]) with visible markers such as [POR CONFIRMAR] or with values already stated in the manual—never invent passwords, API keys, hostnames or local paths.
+- For Copilot/LLM/AI steps, Expected output must be a bullet list of required elements, not a verbatim model response.
+- Ensure command syntax is valid and executable when commands are present.
 - Return the COMPLETE corrected Markdown lab guide. Use the same ASCII delimiters (---LAB_START--- / ---MARKDOWN--- / ---LAB_END---).
 """
     try:
@@ -1332,7 +1773,9 @@ H2 titles MUST be these exact Spanish strings — do not use synonyms such as "R
 3. ## Objetivos de Aprendizaje — 3–5 checkboxes
 4. ## Prerrequisitos — knowledge + access
 5. ## Entorno de Laboratorio — concise HW/SW tables if useful + setup commands
-6. ## Instrucciones Paso a Paso — each step heading MUST be `### Paso N: Title` (colon, not period) with **Objective**, numbered **Instructions**, **Expected output**, **Verification**
+6. ## Instrucciones Paso a Paso — each step heading MUST be `### Paso N: Title` (colon, not period) with **Objective**, numbered **Instructions**, **Expected output** (opcional si no aporta), **Verification**
+   - Paso con comando/fichero determinista: **Expected output** = salida o bloque de código verificable.
+   - Paso con Copilot/LLM/IA: **Expected output** = lista con viñetas de elementos requeridos; nunca el párrafo literal del modelo. Omite la sección si **Verification** ya lista esos elementos.
 7. ## Validación y Pruebas
 8. ## Solución de Problemas — **exactly 2** realistic issues (symptoms, cause, fix)
 9. ## Limpieza
@@ -1348,7 +1791,9 @@ H2 titles MUST be these exact English strings:
 3. ## Learning Objectives — 3–5 checkboxes
 4. ## Prerequisites — knowledge + access
 5. ## Lab Environment — concise HW/SW tables if useful + setup commands
-6. ## Step-by-Step Instructions — each step heading MUST be `### Step N: Title` with **Objective**, numbered **Instructions**, **Expected output**, **Verification**
+6. ## Step-by-Step Instructions — each step heading MUST be `### Step N: Title` with **Objective**, numbered **Instructions**, **Expected output** (optional when not meaningful), **Verification**
+   - Deterministic command/file step: **Expected output** = console output or fenced code block.
+   - Copilot/LLM/AI step: **Expected output** = bullet list of required elements; never a verbatim model paragraph. Omit the section when **Verification** already states those checks.
 7. ## Validation & Testing
 8. ## Troubleshooting — **exactly 2** realistic issues (symptoms, cause, fix)
 9. ## Cleanup
@@ -1403,6 +1848,8 @@ USER REQUIREMENTS (CRITICAL - MUST BE INCORPORATED):
     presupuesto = presupuesto_de_duracion(
         lab_plan.get("estimated_duration") or lab_plan.get("duration_minutes")
     )
+    presupuesto = adjust_presupuesto(presupuesto, master_context.get("audience_profile"))
+    audience_section = writer_audience_block(master_context.get("audience_profile") or {}, is_spanish)
     if presupuesto and is_spanish:
         presupuesto_section = f"""
 PRESUPUESTO DE DURACIÓN (REQUISITO DURO: LOS TIEMPOS DEL TEMARIO SE CUMPLEN):
@@ -1425,6 +1872,23 @@ This lab is declared at {presupuesto['declarada']} minutes and must fit in them.
 """
     else:
         presupuesto_section = ""
+
+    minutos_lectura = lab_plan.get("estimated_duration") or lab_plan.get("duration_minutes")
+    lectura_section = _texto_presupuesto_lectura(minutos_lectura, en_espanol=is_spanish)
+    lectura_corr = master_context.get("reading_budget_correction", "")
+    lectura_corr_section = (
+        f"\n{lectura_corr}\n" if lectura_corr and str(lectura_corr).strip() else ""
+    )
+
+    etiqueta_anexo = _TITULO_ANEXO_ES if is_spanish else _TITULO_ANEXO_EN
+    # previous_lab_context_section is ignored: the live prompt must not tell the
+    # model to reuse the previous lab's files or outputs.
+    del previous_lab_context_section
+    autocontenido_section = f"""
+SELF-CONTAINED PRACTICE (HARD REQUIREMENT):
+This lab must run alone. Do not reuse files, outputs, database names, container names, usernames, ports or directories from any previous lab, and do not tell the student that those already exist.
+When the lab needs an input file (Excel, Word, .eml, CSV or SharePoint content) that the syllabus or the manual does not deliver, inline that content in this lab under the heading "{etiqueta_anexo}" and state that the data is fictitious.
+"""
 
     # Paso 0 de calidad: este es el builder que el handler SIEMPRE usa (el handler
     # llama a generate_all_labs_batch con UN solo lab, línea ~1946). Antes el manual
@@ -1466,6 +1930,35 @@ omítelo o escríbelo como [POR CONFIRMAR]. No introduzcas nombres de fichero ni
         else ""
     )
 
+    golden_section = build_golden_lab_prompt_section(lab_plan, master_context)
+    evidencia_corr = master_context.get("validation_evidence_correction", "")
+    evidencia_section = (
+        f"""
+{evidencia_corr}
+"""
+        if evidencia_corr and evidencia_corr.strip()
+        else ""
+    )
+    # A2e: names, places, deliverables and prohibitions the syllabus states.
+    # The block is empty when nothing was declared, so a normal guide is unchanged.
+    anclajes_section = texto_de_anclajes(
+        master_context.get("syllabus_text") or "",
+        en_espanol=is_spanish,
+    )
+    # C6: the verified catalog, plus the names rejected on the previous attempt.
+    regla_moneda = texto_de_catalogo_para_prompt(is_spanish)
+    currency = master_context.get("currency_correction", "")
+    currency_section = (
+        f"""
+CORRECCIÓN OBLIGATORIA (moneda de Microsoft 365 Copilot):
+{currency}
+No dejes el nombre rechazado en el texto. Si no está en el catálogo ni en el manual,
+escríbelo como [POR CONFIRMAR].
+"""
+        if currency and str(currency).strip()
+        else ""
+    )
+
     return f"""You are an expert technical instructor. Generate ONE complete lab guide in Markdown.
 
 LANGUAGE: All section titles and prose in **{tl}**. Code/commands may remain in English.
@@ -1477,20 +1970,27 @@ COURSE CONTEXT (brief):
 - Notes: {spec_line}
 {add_req_section}
 {entorno_section}
+{anclajes_section}
 {manual_section}
 {correction_section}
+{evidencia_section}
+{currency_section}
+{regla_moneda}
 LAB SPECIFICATION:
 {labs_summary_text}
-{previous_lab_context_section}
+{autocontenido_section}
 {lesson_context_section}
 {demo_section}
+{audience_section}
 
 {structure_block}
 {presupuesto_section}
-QUALITY: Be thorough and professional, but **concise**. Target about 4,000–8,000 words of useful content unless the Bloom level truly requires more. Do not pad with generic filler.
+{lectura_section}
+{lectura_corr_section}
+QUALITY: Be thorough and professional, but **concise**. Stay inside the reading budget above. Do not pad with generic filler.
 
 {THOR_QUALITY_RULES}
-OUTPUT FORMAT (required; use these exact ASCII delimiters, case-sensitive):
+{golden_section}OUTPUT FORMAT (required; use these exact ASCII delimiters, case-sensitive):
 ---LAB_START---
 LAB_ID: {lid}
 ---MARKDOWN---
@@ -1900,7 +2400,7 @@ CRITICAL FORMATTING RULES
 3. LICENCIAS Y HERRAMIENTAS: Differentiate Microsoft 365 Copilot, Copilot Chat, Designer, Planner and similar tools, stating the license and configuration for each.
 4. DURACIÓN: Keep each lab within the time and complexity defined by the syllabus; for a 90-minute seminar prioritize effective tool usage.
 5. DEPENDENCIAS: Reduce auxiliary files/dependencies; embed in the prompts any information that does not require an external file. Provide controlled scenarios, inputs and sources so results are comparable.
-6. VALIDACIÓN MEDIBLE: Define measurable criteria and sufficient evidence (command, file, output, screenshot). Do NOT claim production-ready from five generic tests or a 60% success rate.
+6. VALIDACIÓN MEDIBLE: Define measurable criteria and sufficient evidence (command, file, output, screenshot). For Copilot/LLM steps, Expected output must be a bullet list of required elements or sections—never a verbatim paragraph the model might return; omit Expected output when Verification already lists those checks. Do NOT claim production-ready from five generic tests, vague success rates, or invented passwords/paths.
 7. LIMITACIONES DE IA: In Validation & Testing include at least one adversarial case: nonexistent/contradictory information, missing evidence, or instructions embedded in documents (prompt injection).
 8. PROMPTING: Evaluate precision, traceability, uncertainty, usefulness and human supervision; do NOT require exposing internal reasoning as a success criterion.
 9. PEDAGOGÍA: Favor experimentation and reinforcement over documentation/captures.
@@ -1948,15 +2448,7 @@ Generate ALL {len(lab_plans)} labs now:
                 response_text = call_gemini_agent(prompt, google_key)
 
         if model_provider == "bedrock":
-            try:
-                response_text = call_bedrock_agent(prompt, DEFAULT_BEDROCK_MODEL)
-            except Exception as e:
-                if "AccessDenied" in str(e) and DEFAULT_BEDROCK_MODEL != "us.anthropic.claude-sonnet-4-6":
-                    print(f"⚠️ Primary model {DEFAULT_BEDROCK_MODEL} AccessDenied: {e}")
-                    print("🔄 Retrying with fallback model us.anthropic.claude-sonnet-4-6...")
-                    response_text = call_bedrock_agent(prompt, "us.anthropic.claude-sonnet-4-6")
-                else:
-                    raise
+            response_text = call_bedrock_agent(prompt, DEFAULT_BEDROCK_MODEL)
         
         print("✅ AI response received, parsing with delimiters...")
         # Keep full model output for fallbacks (JSON branch mutates working copies)
@@ -2170,6 +2662,33 @@ def guardar_informe_referencial(bucket: str, project_folder: str, informes: Dict
             "ok_alta_confianza": altas == 0,
             "por_laboratorio": informes,
         }
+        necesitan = []
+        avisos = []
+        for lab_id, reporte in informes.items():
+            bloquean, advertencias = partir_hallazgos(reporte.get("violaciones"))
+            estado = reporte.get("quality_status")
+            if estado is None:
+                estado = "needs_review" if bloquean else "passed"
+            if estado == "needs_review" or bloquean:
+                necesitan.append({"lab_id": lab_id, "findings": bloquean})
+            elif advertencias or reporte.get("quality_warnings"):
+                avisos.append({
+                    "lab_id": lab_id,
+                    "findings": advertencias or reporte.get("quality_warnings") or [],
+                })
+        payload["quality_status"] = "needs_review" if necesitan else "passed"
+        payload["labs_needing_review"] = necesitan
+        payload["quality_warnings"] = avisos
+        if necesitan:
+            print(
+                f"🚫 QUALITY GATE: referential report {key} needs_review "
+                f"({len(necesitan)} lab(s) with high-confidence findings)"
+            )
+        elif avisos:
+            print(
+                f"⚠️  QUALITY GATE: referential report {key} passed with "
+                f"low-confidence warnings on {len(avisos)} lab(s)"
+            )
         s3_client.put_object(
             Bucket=bucket,
             Key=key,
@@ -2180,6 +2699,30 @@ def guardar_informe_referencial(bucket: str, project_folder: str, informes: Dict
         return key
     except Exception as e:
         print(f"⚠️  No se pudo guardar el informe B1/B2 de integridad referencial: {e}")
+        return ""
+
+
+def guardar_informe_moneda(bucket: str, project_folder: str, informes: Dict[str, Any]) -> str:
+    """Write the C6 Copilot-currency report under ``validation/``.
+
+    Same accumulation rule as the referential report: one lab per invocation.
+    """
+    if not informes:
+        return ""
+    try:
+        key = f"{project_folder}/validation/copilot-currency.json"
+        fusionados = {**cargar_informes_previos(bucket, key), **informes}
+        payload = construir_informe_moneda(fusionados)
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(payload, indent=2, ensure_ascii=False),
+            ContentType="application/json",
+        )
+        print(f"📝 Informe C6 de moneda Copilot guardado: {key}")
+        return key
+    except Exception as e:
+        print(f"⚠️  No se pudo guardar el informe C6 de moneda Copilot: {e}")
         return ""
 
 
@@ -2210,6 +2753,9 @@ def lambda_handler(event, context):
     print("="*70)
     
     try:
+        # Full state from RegenerateInvalidLabs carries invalid_lab_ids instead of
+        # lab_ids. A shaped batch payload already has lab_ids and is left as-is.
+        event = normalizar_evento_writer(event)
         # Extract parameters
         course_bucket = event.get('course_bucket', 'crewai-course-artifacts')
         master_plan_key = event['master_plan_key']
@@ -2318,28 +2864,16 @@ def lambda_handler(event, context):
             )
 
         referential_reports: Dict[str, Any] = {}
+        labs_needing_review: Dict[str, List[dict]] = {}
+        labs_quality_warnings: Dict[str, List[dict]] = {}
+        currency_reports: Dict[str, Any] = {}
 
-        # Contexto de conjunto para B2/B3c. En modo lote `lab_plans` viene filtrado a
-        # un solo laboratorio, así que la posición se calcula sobre el plan COMPLETO;
-        # usar `idx` del bucle daba 1 siempre y desactivaba la continuidad.
+        # Full-plan order: B2 (a later lab's output) depends on position.
+        # A file created in an earlier lab is not delivered. Each practice runs alone.
         orden_labs = [
             p.get("lab_id") for p in master_plan.get("lab_plans", []) if p.get("lab_id")
         ]
         salidas_por_lab = salidas_de_laboratorios(master_plan)
-        creados_antes: set[str] = set()
-        if orden_labs and lab_plans:
-            primera = next(
-                (i for i, otro in enumerate(orden_labs) if otro == lab_plans[0]["lab_id"]),
-                0,
-            )
-            creados_antes = _referentes_creados_en_labs_anteriores(
-                course_bucket, project_folder, orden_labs[:primera]
-            )
-            if creados_antes:
-                print(
-                    f"🔗 B3c: {len(creados_antes)} referente(s) creados en laboratorios "
-                    f"anteriores se aceptan como legítimos"
-                )
 
         # Build master context for all labs (including language)
         additional_requirements = (
@@ -2358,13 +2892,19 @@ def lambda_handler(event, context):
             'overall_objectives': master_plan.get('overall_objectives', []),
             'target_language': target_language,  # NEW: Pass language to prompt
             'manual_reference_text': manual_reference_text,
-            'additional_requirements': additional_requirements
+            'additional_requirements': additional_requirements,
+            'audience_profile': (master_plan.get('metadata') or {}).get('audience_profile'),
+            # Raw syllabus. The prompt prints only the locked anchors, not this text.
+            'syllabus_text': outline_reference_text,
         }
         
         # Step 2: Generate lab guides ONE AT A TIME for reliability
         # both GPT-5 and Bedrock handle single-lab requests reliably
         # GPT-5 sometimes skips labs in multi-lab requests
         labs_markdown = {}
+        models_used: Dict[str, str] = {}
+        placeholders: List[dict] = []
+        failed_lab_ids: List[str] = []
         
         # Maps lab_id to its lesson content key
         lab_lesson_keys = event.get('lab_lesson_keys', {})
@@ -2373,9 +2913,12 @@ def lambda_handler(event, context):
             lab_id = lab_plan['lab_id']
             print(f"\n📦 Lab {idx}/{len(lab_plans)}: Generating {lab_id}...")
 
-            # La corrección de integridad referencial es específica del laboratorio en
-            # curso: no debe arrastrarse al siguiente.
+            # La corrección de integridad referencial y la de evidencia medible son
+            # específicas del laboratorio en curso: no deben arrastrarse al siguiente.
             master_context.pop("referential_correction", None)
+            master_context.pop("validation_evidence_correction", None)
+            master_context.pop("currency_correction", None)
+            master_context.pop("reading_budget_correction", None)
 
             # En actualización selectiva el lab pedido SE regenera, aunque exista:
             # el skip-if-exists solo aplica a la generación normal.
@@ -2392,13 +2935,16 @@ def lambda_handler(event, context):
                         body = s3_client.get_object(
                             Bucket=course_bucket, Key=existing_key
                         )["Body"].read().decode("utf-8")
-                        if body.strip():
+                        if body.strip() and MARCA_PLACEHOLDER not in body:
                             labs_markdown[lab_id] = body
-                            creados_antes |= referentes_creados(body)
                             print(
                                 f"  ⏭️  Skipping generation; using existing s3://{course_bucket}/{existing_key}"
                             )
                             continue
+                        if body.strip() and MARCA_PLACEHOLDER in body:
+                            print(
+                                f"  🔁 Existing lab {lab_id} is a placeholder; regenerating"
+                            )
                     except Exception as e:
                         print(f"⚠️  Could not read existing lab {existing_key}, regenerating: {e}")
 
@@ -2408,16 +2954,13 @@ def lambda_handler(event, context):
                 lesson_key = lab_lesson_keys[lab_id]
                 lesson_content = load_lesson_content(course_bucket, lesson_key)
 
-            # Posición en el plan completo (no en el lote): B2 y B3c dependen de ella.
+            # Position in the full plan (not in this batch): B2 depends on it.
+            # The previous lab is not loaded; this practice does not reuse its files.
             posicion = orden_labs.index(lab_id) if lab_id in orden_labs else 0
-
-            # Load previous lab context for sequential continuity
             previous_lab_context = ""
-            if posicion > 0:
-                prev_id = orden_labs[posicion - 1]
-                previous_lab_context = _get_previous_lab_context(course_bucket, project_folder, prev_id)
 
             last_error: Optional[Exception] = None
+            _modelo_que_respondio["id"] = None
             for attempt in range(1, MAX_LAB_GENERATION_ATTEMPTS + 1):
                 try:
                     batch_results = generate_all_labs_batch(
@@ -2443,65 +2986,149 @@ def lambda_handler(event, context):
                             is_spanish=course_language.startswith('es')
                         )
 
-                        # Verificación B1/B2/B3c: todo fichero o ruta que el laboratorio
-                        # referencia debe estar declarado en el temario, el manual o el
-                        # plan, haberse creado en un paso anterior de este laboratorio,
-                        # haberse creado en un laboratorio ANTERIOR (B3c), y no puede ser
-                        # la salida de un laboratorio POSTERIOR (B2).
+                        hallazgos_evidencia = hallazgos_validacion_no_medible(verified_guide)
+                        if (
+                            hallazgos_evidencia
+                            and attempt >= MAX_LAB_GENERATION_ATTEMPTS
+                        ):
+                            reparada_validacion = reparar_validacion_no_medible(verified_guide)
+                            if reparada_validacion != verified_guide:
+                                verified_guide = reparada_validacion
+                                hallazgos_evidencia = hallazgos_validacion_no_medible(
+                                    verified_guide
+                                )
+                                print(
+                                    f"  🔧 Validación medible: un pase de reparación "
+                                    f"en el último intento de {lab_id}"
+                                )
+                        if hallazgos_evidencia:
+                            print(
+                                f"  🔎 Validación medible de {lab_id}: "
+                                f"{len(hallazgos_evidencia)} hallazgo(s)"
+                            )
+                            for h in hallazgos_evidencia[:8]:
+                                print(f"     ⚠️  {h}")
+                        if (
+                            hallazgos_evidencia
+                            and attempt < MAX_LAB_GENERATION_ATTEMPTS
+                            and _reintento_validacion_medible_habilitado()
+                        ):
+                            master_context["validation_evidence_correction"] = (
+                                mensaje_correccion_validacion(hallazgos_evidencia)
+                            )
+                            raise RuntimeError(
+                                f"Measurable validation failed for {lab_id}: "
+                                f"{len(hallazgos_evidencia)} finding(s)"
+                            )
+
+                        # B1/B2: every file or path must be declared in the syllabus, the manual
+                        # or the plan, or created in a step of THIS lab. An earlier lab
+                        # does not supply inputs. A later lab's output is still B2.
                         posteriores = {
                             otro: salidas_por_lab.get(otro) or []
                             for otro in orden_labs[posicion + 1:]
                         }
-                        referential_report = auditar_laboratorio(
-                            verified_guide,
-                            fuentes=referential_sources,
-                            plan=referential_plan_text,
-                            creados_antes=creados_antes,
-                            salidas_posteriores=posteriores,
-                            referencias_posteriores=referencias_a_labs_posteriores(
-                                verified_guide, posicion, orden_labs
-                            ),
-                            # B6: la duración que declara el propio laboratorio manda;
-                            # si no la declara, se usa la del plan (coinciden en 176 de
-                            # los 179 laboratorios que la declaran).
-                            duracion_min=(
-                                duracion_declarada(verified_guide)
+
+                        def _auditar(guia: str) -> dict:
+                            return auditar_laboratorio(
+                                guia,
+                                fuentes=referential_sources,
+                                plan=referential_plan_text,
+                                creados_antes=None,
+                                salidas_posteriores=posteriores,
+                                referencias_posteriores=referencias_a_labs_posteriores(
+                                    guia, posicion, orden_labs
+                                ),
+                                # B6: la duración que declara el propio laboratorio manda;
+                                # si no la declara, se usa la del plan (coinciden en 176 de
+                                # los 179 laboratorios que la declaran).
+                                duracion_min=(
+                                    duracion_declarada(guia)
+                                    or lab_plan.get("estimated_duration")
+                                    or lab_plan.get("duration_minutes")
+                                ),
+                                requisitos_texto=requisitos_declarados(
+                                    master_context.get("software_requirements"),
+                                    master_context.get("hardware_requirements"),
+                                ),
+                                expected_outcomes=lab_plan.get("expected_outcomes"),
+                                # C2: lo que la petición declara del entorno (SO, shells
+                                # y mandatos prohibidos) se audita contra el laboratorio.
+                                entorno=entorno_de_peticion(
+                                    master_context.get("additional_requirements") or ""
+                                ),
+                                # A2e reads the syllabus only. The manual is not a list of
+                                # scenario entities. An earlier lab still does not supply inputs.
+                                temario=outline_reference_text,
+                            )
+
+                        def _altas(informe: dict) -> list:
+                            return [
+                                v
+                                for v in informe["violaciones"]
+                                if v.get("confianza") == "alta"
+                                and (
+                                    v.get("verificacion") != "B6"
+                                    or _reintento_duracion_habilitado()
+                                )
+                                and (
+                                    v.get("verificacion") != "B5"
+                                    or _reintento_requisitos_habilitado()
+                                )
+                                and (
+                                    v.get("verificacion") != "B3p"
+                                    or _reintento_entregables_habilitado()
+                                )
+                                and (
+                                    v.get("verificacion") != "C2"
+                                    or _reintento_entorno_habilitado()
+                                )
+                            ]
+
+                        referential_report = _auditar(verified_guide)
+                        if attempt >= MAX_LAB_GENERATION_ATTEMPTS:
+                            reparada = reparar_anclajes_en_guia(
+                                verified_guide,
+                                outline_reference_text,
+                                en_espanol=course_language.startswith("es"),
+                            )
+                            reparada = reparar_requisitos_contra_temario(
+                                reparada, outline_reference_text
+                            )
+                            minutos_lectura = (
+                                duracion_declarada(reparada)
                                 or lab_plan.get("estimated_duration")
                                 or lab_plan.get("duration_minutes")
-                            ),
-                            requisitos_texto=requisitos_declarados(
-                                master_context.get("software_requirements"),
-                                master_context.get("hardware_requirements"),
-                            ),
-                            expected_outcomes=lab_plan.get("expected_outcomes"),
-                            # C2: lo que la petición declara del entorno (SO, shells
-                            # y mandatos prohibidos) se audita contra el laboratorio.
-                            entorno=entorno_de_peticion(
-                                master_context.get("additional_requirements") or ""
-                            ),
+                            )
+                            reparada = recortar_a_presupuesto(reparada, minutos_lectura)
+                            if reparada != verified_guide:
+                                verified_guide = reparada
+                                referential_report = _auditar(verified_guide)
+                                print(
+                                    f"  🔧 Reparación dirigida del último intento en {lab_id}"
+                                )
+                        altas = _altas(referential_report)
+                        # The model gets the remaining attempts to drop an invented
+                        # name or use a file the syllabus already delivers. The guide
+                        # that ships still has to run alone, so any Excel, Word, .eml,
+                        # CSV or SharePoint input that is still missing is inlined.
+                        va_a_reintentar = (
+                            bool(altas)
+                            and attempt < MAX_LAB_GENERATION_ATTEMPTS
+                            and _reintento_referencial_habilitado()
                         )
+                        if not va_a_reintentar:
+                            guia_anexada = anexar_entradas_no_entregadas(
+                                verified_guide,
+                                referential_report,
+                                is_spanish=course_language.startswith("es"),
+                            )
+                            if guia_anexada != verified_guide:
+                                verified_guide = guia_anexada
+                                referential_report = _auditar(verified_guide)
+                                altas = _altas(referential_report)
+                                print(f"  📎 Anexo de datos ficticios añadido a {lab_id}")
                         referential_reports[lab_id] = referential_report
-                        altas = [
-                            v
-                            for v in referential_report["violaciones"]
-                            if v.get("confianza") == "alta"
-                            and (
-                                v.get("verificacion") != "B6"
-                                or _reintento_duracion_habilitado()
-                            )
-                            and (
-                                v.get("verificacion") != "B5"
-                                or _reintento_requisitos_habilitado()
-                            )
-                            and (
-                                v.get("verificacion") != "B3p"
-                                or _reintento_entregables_habilitado()
-                            )
-                            and (
-                                v.get("verificacion") != "C2"
-                                or _reintento_entorno_habilitado()
-                            )
-                        ]
                         print(
                             f"  🔎 Integridad referencial y duración de {lab_id}: "
                             f"{len(referential_report['violaciones'])} hallazgo(s) "
@@ -2515,11 +3142,7 @@ def lambda_handler(event, context):
                                 f"mencion(es) de hoja de ruta a laboratorios posteriores"
                             )
 
-                        if (
-                            altas
-                            and attempt < MAX_LAB_GENERATION_ATTEMPTS
-                            and _reintento_referencial_habilitado()
-                        ):
+                        if va_a_reintentar:
                             # Reintento correctivo solo con lo que el curso dice aportar.
                             # El resto (ficheros creados por el propio laboratorio, del
                             # proyecto o salidas esperadas) queda solo registrado: la
@@ -2533,10 +3156,155 @@ def lambda_handler(event, context):
                                 f"{len(altas)} high-confidence finding(s)"
                             )
 
-                        # Solo el laboratorio aceptado aporta referentes creados para el
-                        # siguiente: un intento rechazado no debe legitimar nada.
-                        creados_antes.update(referential_report.get("creados") or ())
+                        # Reading budget: body prose and the fictitious annex are
+                        # counted apart. While attempts remain, ask for a shorter
+                        # draft with the actual counts. The last attempt records a
+                        # medium finding and still ships the lab.
+                        medida_lectura = medir_lectura(
+                            verified_guide,
+                            duracion_declarada(verified_guide)
+                            or lab_plan.get("estimated_duration")
+                            or lab_plan.get("duration_minutes"),
+                        )
+                        if medida_lectura.get("excede"):
+                            print(
+                                f"  🔎 Lectura de {lab_id}: "
+                                f"{medida_lectura.get('palabras')} palabras "
+                                f"(presupuesto {medida_lectura.get('palabras_max')}), "
+                                f"anexo {medida_lectura.get('palabras_anexo')} "
+                                f"(tope {medida_lectura.get('anexo_max')})"
+                            )
+                        if (
+                            medida_lectura.get("excede")
+                            and attempt < MAX_LAB_GENERATION_ATTEMPTS
+                            and _reintento_lectura_habilitado()
+                        ):
+                            master_context["reading_budget_correction"] = mensaje_acortar(
+                                medida_lectura,
+                                en_espanol=course_language.startswith("es"),
+                            )
+                            raise RuntimeError(
+                                f"Reading budget exceeded for {lab_id}: "
+                                f"{medida_lectura.get('palabras')} words "
+                                f"(max {medida_lectura.get('palabras_max')}), "
+                                f"annex {medida_lectura.get('palabras_anexo')} "
+                                f"(max {medida_lectura.get('anexo_max')})"
+                            )
+                        if (
+                            medida_lectura.get("excede")
+                            and attempt >= MAX_LAB_GENERATION_ATTEMPTS
+                        ):
+                            recortada = recortar_a_presupuesto(
+                                verified_guide,
+                                medida_lectura.get("duracion")
+                                or lab_plan.get("estimated_duration"),
+                            )
+                            if recortada != verified_guide:
+                                verified_guide = recortada
+                                medida_lectura = medir_lectura(
+                                    verified_guide,
+                                    medida_lectura.get("duracion")
+                                    or lab_plan.get("estimated_duration"),
+                                )
+                                print(f"  🔧 Lectura recortada al presupuesto en {lab_id}")
+                        hallazgo_r1 = hallazgo_lectura(medida_lectura)
+                        if hallazgo_r1:
+                            referential_report.setdefault("violaciones", []).append(hallazgo_r1)
+                        if (
+                            hallazgos_evidencia
+                            and attempt >= MAX_LAB_GENERATION_ATTEMPTS
+                        ):
+                            for aviso in hallazgos_evidencia:
+                                referential_report.setdefault("violaciones", []).append(
+                                    {
+                                        "verificacion": "R5",
+                                        "confianza": "baja",
+                                        "valor": str(aviso)[:300],
+                                    }
+                                )
+
+                        # C6: a Copilot feature, agent, or button must be in the
+                        # verified catalog (or the uploaded manual or the syllabus).
+                        # Unknown and deprecated names retry while attempts remain.
+                        # The last attempt saves the lab and records a warning.
+                        # CURRENCY_RETRY=0 only records them and does not retry.
+                        # A surface the syllabus names is authorized. Deprecated
+                        # catalog names are still findings, and they do not block
+                        # delivery.
+                        currency_report = auditar_superficies_copilot(
+                            verified_guide,
+                            manual="\n".join(
+                                parte for parte in (
+                                    master_context.get("manual_reference_text") or "",
+                                    outline_reference_text or "",
+                                ) if parte
+                            ),
+                        )
+                        currency_reports[lab_id] = currency_report
+                        bloqueos_moneda = [
+                            h for h in currency_report.get("hallazgos") or []
+                            if h.get("bloquea")
+                        ]
+                        if bloqueos_moneda:
+                            print(
+                                f"  🔎 Moneda Copilot de {lab_id}: "
+                                f"{len(bloqueos_moneda)} bloqueo(s) "
+                                f"(catálogo {currency_report.get('catalog_version')})"
+                            )
+                            for hallazgo in bloqueos_moneda[:10]:
+                                print(
+                                    f"     ⚠️  {hallazgo.get('nombre')} "
+                                    f"[{hallazgo.get('tipo')}]"
+                                )
+                        if bloqueos_moneda and _reintento_moneda_habilitado():
+                            master_context["currency_correction"] = (
+                                mensaje_de_correccion_moneda(bloqueos_moneda)
+                            )
+                            if attempt < MAX_LAB_GENERATION_ATTEMPTS:
+                                raise RuntimeError(
+                                    f"C6 currency check failed for {lab_id}: "
+                                    f"{len(bloqueos_moneda)} unresolved or deprecated "
+                                    f"Copilot surface(s)"
+                                )
+                            for hallazgo in bloqueos_moneda:
+                                referential_report.setdefault("violaciones", []).append(
+                                    {
+                                        "verificacion": "C6",
+                                        "confianza": "media",
+                                        "valor": (
+                                            f"{hallazgo.get('nombre')} "
+                                            f"[{hallazgo.get('tipo')}]"
+                                        ),
+                                    }
+                                )
+                            print(
+                                f"  ⚠️  C6 de {lab_id}: último intento, se guarda "
+                                f"el borrador con advertencia."
+                            )
+
+                        # Final text: high-confidence findings that survived the last
+                        # retry (or were never retried, such as B3p) fail the gate.
+                        # Low-confidence findings stay warnings. The draft is still
+                        # saved so a reviewer can see it; delivery is not a pass.
+                        # Files created here are not passed to the next lab: each
+                        # practice stays self-contained (creados_antes=None).
+                        objetivo_ausente = hallazgo_objetivo_ausente(verified_guide, lab_plan)
+                        if objetivo_ausente:
+                            referential_report.setdefault("violaciones", []).append(objetivo_ausente)
+                        bloquean, advertencias = partir_hallazgos(
+                            referential_report.get("violaciones")
+                        )
+                        referential_report["quality_status"] = (
+                            "needs_review" if bloquean else "passed"
+                        )
+                        referential_report["quality_warnings"] = advertencias
+                        _registrar_puerta_de_lab(lab_id, attempt, bloquean, advertencias)
+                        if bloquean:
+                            labs_needing_review[lab_id] = bloquean
+                        elif advertencias:
+                            labs_quality_warnings[lab_id] = advertencias
                         labs_markdown[lab_id] = verified_guide
+                        models_used[lab_id] = modelo_que_produjo_el_lab() or model_provider
                         print(f"  ✅ Lab {lab_id} generated & verified (Demo={is_demo}) (attempt {attempt}/{MAX_LAB_GENERATION_ATTEMPTS})")
                         break
                     last_error = ValueError(f"Model returned no content for {lab_id}")
@@ -2552,10 +3320,22 @@ def lambda_handler(event, context):
                         _sleep_before_bedrock_retry(attempt - 1)
 
             if lab_id not in labs_markdown:
-                msg = f"Lab {lab_id} failed after {MAX_LAB_GENERATION_ATTEMPTS} attempts"
+                motivo = f"Lab {lab_id} failed after {MAX_LAB_GENERATION_ATTEMPTS} attempts"
                 if last_error:
-                    msg += f": {last_error}"
-                raise RuntimeError(msg)
+                    motivo += f": {last_error}"
+                print(f"  ⚠️  {motivo}. Shipping a placeholder.")
+                labs_markdown[lab_id] = markdown_de_laboratorio_pendiente(
+                    lab_id, lab_plan.get("lab_title") or lab_id, motivo
+                )
+                placeholders.append({"lab_id": lab_id, "reason": motivo[:500]})
+                failed_lab_ids.append(lab_id)
+                labs_quality_warnings[lab_id] = [
+                    {
+                        "verificacion": "PLACEHOLDER",
+                        "confianza": "media",
+                        "valor": motivo[:300],
+                    }
+                ]
         
         # Step 3: Save each lab guide to S3
         lab_guide_keys = []
@@ -2570,30 +3350,67 @@ def lambda_handler(event, context):
                 print(f"  ⚠️  Lab {lab_id} not found in generated content, skipping")
                 continue
             
-            try:
-                lab_key = save_lab_guide_to_s3(
-                    bucket=course_bucket,
-                    project_folder=project_folder,
-                    lab_id=lab_id,
-                    lab_title=lab_title,
-                    lab_guide=labs_markdown[lab_id]
-                )
+            lab_key = _guardar_guia_con_reintento(
+                course_bucket, project_folder, lab_id, lab_title, labs_markdown[lab_id]
+            )
+            if lab_key:
                 lab_guide_keys.append(lab_key)
                 print(f"  ✅ Saved lab {lab_id}")
-            except Exception as e:
-                print(f"  ❌ Failed to save lab {lab_id}: {e}")
-                raise RuntimeError(f"Failed to save lab guide {lab_id} to S3: {e}") from e
+            else:
+                print(f"  ❌ Failed to save lab {lab_id} after retries")
+                if lab_id not in failed_lab_ids:
+                    failed_lab_ids.append(lab_id)
+                labs_quality_warnings.setdefault(lab_id, []).append(
+                    {
+                        "verificacion": "S3",
+                        "confianza": "media",
+                        "valor": f"no se pudo guardar {lab_id} tras reintentos",
+                    }
+                )
 
         if len(lab_guide_keys) != len(lab_plans):
-            raise RuntimeError(
-                f"Expected {len(lab_plans)} lab files saved, got {len(lab_guide_keys)}"
+            print(
+                f"  ⚠️  Expected {len(lab_plans)} lab files, saved {len(lab_guide_keys)}. "
+                f"The course continues; failed ids: {failed_lab_ids}"
             )
 
         guardar_informe_referencial(course_bucket, project_folder, referential_reports)
+        guardar_informe_moneda(course_bucket, project_folder, currency_reports)
+
+        revisiones = [
+            {"lab_id": lab_id, "findings": hallazgos}
+            for lab_id, hallazgos in labs_needing_review.items()
+        ]
+        avisos = [
+            {"lab_id": lab_id, "findings": hallazgos}
+            for lab_id, hallazgos in labs_quality_warnings.items()
+        ]
+        quality_status = "needs_review" if revisiones else "passed"
+        if placeholders or failed_lab_ids:
+            quality_summary = resumir_hallazgos(revisiones)
+            if quality_summary == "passed":
+                quality_summary = (
+                    "WARNINGS placeholders="
+                    + ",".join(item["lab_id"] for item in placeholders)
+                )
+        else:
+            quality_summary = resumir_hallazgos(revisiones)
 
         print(f"\n{'='*70}")
-        print(f"✅ LAB WRITING COMPLETED")
+        if revisiones:
+            print(
+                f"🚫 LAB WRITING NEEDS REVIEW: {len(revisiones)}/{len(lab_plans)} "
+                f"lab(s) keep high-confidence findings after the final retry. "
+                f"The course is still delivered. {quality_summary}"
+            )
+        else:
+            print(f"✅ LAB WRITING COMPLETED")
+            if avisos:
+                print(
+                    f"   ⚠️  {len(avisos)} lab(s) with non-blocking warnings only"
+                )
         print(f"   Generated: {len(lab_guide_keys)}/{len(lab_plans)} labs")
+        print(f"   quality_status: {quality_status}")
         print(f"{'='*70}\n")
 
         return {
@@ -2603,6 +3420,13 @@ def lambda_handler(event, context):
             'project_folder': project_folder,
             'bucket': course_bucket,
             'model_provider': model_provider,
+            'quality_status': quality_status,
+            'quality_summary': quality_summary,
+            'labs_needing_review': revisiones,
+            'quality_warnings': avisos,
+            'placeholders': placeholders,
+            'failed_lab_ids': failed_lab_ids,
+            'models_used': models_used,
         }
     
     except KeyError as e:
@@ -2613,4 +3437,7 @@ def lambda_handler(event, context):
         print(f"❌ Unexpected error: {e}")
         import traceback
         traceback.print_exc()
+        recuperado = _entregar_placeholders_tras_fallo(event, e)
+        if recuperado:
+            return recuperado
         raise

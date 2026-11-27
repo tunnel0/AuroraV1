@@ -7,10 +7,110 @@ Returns the current status and results of a course generation execution.
 """
 
 import json
-import boto3
 import os
+import sys
+import boto3
 from urllib.parse import unquote
 from botocore.exceptions import ClientError
+
+_LAMBDA_DIR = os.path.dirname(os.path.abspath(__file__))
+if _LAMBDA_DIR not in sys.path:
+    sys.path.insert(0, _LAMBDA_DIR)
+
+from course_generation_status import warnings_from_execution_output
+
+
+def _detalle_de_calidad(salida: dict, sf_cause) -> str:
+    if sf_cause:
+        return str(sf_cause)
+    resumen = salida.get("lab_quality_summary") or salida.get("quality_summary")
+    if resumen:
+        return str(resumen)
+    summaries = salida.get("lab_quality_summaries")
+    if summaries:
+        return json.dumps(summaries, ensure_ascii=False)
+    return "hallazgos de calidad / quality findings"
+
+
+def estado_visible_del_curso(execution_status, sf_error=None, sf_cause=None, parsed_output=None):
+    """Fields the client status API shows.
+
+    A delivered course is SUCCEEDED or SUCCEEDED_WITH_WARNINGS. Quality findings,
+    dead links, placeholders, and a missing PPT or PDF are warnings. They are not
+    a failure and they do not set ``needs_review`` on a succeeded execution.
+    ``needs_review`` and ``link_audit_failed`` remain only for a historical FAILED
+    execution that used the old gate. A planner failure is still ``failed``.
+    """
+    salida = parsed_output if isinstance(parsed_output, dict) else {}
+    decision = salida.get("lab_quality_decision")
+    decision_needs = isinstance(decision, dict) and decision.get("needs_review") is True
+    hallazgos = (
+        sf_error == "LabQualityNeedsReview"
+        or salida.get("lab_quality_needs_review") is True
+        or decision_needs
+        or salida.get("quality_status") == "needs_review"
+    )
+    generation_warnings = warnings_from_execution_output(salida)
+    if hallazgos and execution_status == "SUCCEEDED":
+        generation_warnings = list(generation_warnings) + [
+            {
+                "code": "lab_quality",
+                "component": "Labs",
+                "detail": _detalle_de_calidad(salida, sf_cause),
+            }
+        ]
+    fallo_historico_calidad = execution_status == "FAILED" and sf_error == "LabQualityNeedsReview"
+    fallo_historico_enlaces = execution_status == "FAILED" and sf_error == "LinkAuditFailed"
+    needs = fallo_historico_calidad
+    if fallo_historico_calidad:
+        quality_status = "needs_review"
+        course_status = "needs_review"
+    elif fallo_historico_enlaces:
+        quality_status = "failed"
+        course_status = "link_audit_failed"
+    elif execution_status == "FAILED":
+        quality_status = "failed"
+        course_status = "failed"
+    elif execution_status == "SUCCEEDED" and (generation_warnings or hallazgos):
+        quality_status = "passed"
+        course_status = "SUCCEEDED_WITH_WARNINGS"
+    elif execution_status == "SUCCEEDED":
+        quality_status = "passed"
+        course_status = "passed"
+    else:
+        quality_status = None
+        course_status = execution_status
+
+    summaries = salida.get("lab_quality_summaries")
+    summary_text = None
+    if isinstance(summaries, list) and summaries:
+        summary_text = json.dumps(summaries, ensure_ascii=False)
+    error = None
+    if needs or execution_status == "FAILED":
+        error = (
+            sf_cause
+            or sf_error
+            or salida.get("lab_quality_summary")
+            or summary_text
+            or salida.get("quality_summary")
+            or (salida.get("error") if isinstance(salida.get("error"), str) else None)
+            or "Unknown error"
+        )
+    return {
+        "quality_status": quality_status,
+        "course_status": course_status,
+        "needs_review": bool(needs),
+        "error": error,
+        "quality_summary": (
+            sf_cause
+            or salida.get("lab_quality_summary")
+            or summary_text
+            or salida.get("quality_summary")
+        ),
+        "quality_warnings": salida.get("quality_warnings") or [],
+        "labs_needing_review": salida.get("labs_needing_review") or [],
+        "generation_warnings": generation_warnings,
+    }
 
 def lambda_handler(event, context):
     """
@@ -86,6 +186,8 @@ def lambda_handler(event, context):
         execution_status = execution_response['status']
         execution_input = json.loads(execution_response.get('input', '{}'))
         execution_output = execution_response.get('output')
+        sf_error = execution_response.get('error')
+        sf_cause = execution_response.get('cause')
 
         # Parse execution output if available
         parsed_output = None
@@ -131,6 +233,24 @@ def lambda_handler(event, context):
         else:
             response_body["queue_status"] = execution_status.lower() if execution_status else "unknown"
 
+        visible = estado_visible_del_curso(
+            execution_status, sf_error, sf_cause, parsed_output
+        )
+        response_body.update({
+            "quality_status": visible["quality_status"],
+            "course_status": visible["course_status"],
+            "needs_review": visible["needs_review"],
+            "quality_summary": visible["quality_summary"],
+            "quality_warnings": visible["quality_warnings"],
+            "labs_needing_review": visible["labs_needing_review"],
+        })
+        if visible["generation_warnings"]:
+            response_body["generation_warnings"] = visible["generation_warnings"]
+        print(
+            f"Course status for client: {visible['course_status']} "
+            f"(execution {execution_status}, quality {visible['quality_status']})"
+        )
+
         # Add output if execution completed successfully
         if execution_status == 'SUCCEEDED' and parsed_output:
             response_body.update({
@@ -141,11 +261,14 @@ def lambda_handler(event, context):
                 "project_folder": parsed_output.get('project_folder')
             })
 
-        # Add error details if execution failed
-        elif execution_status == 'FAILED':
+        # Add error details if execution failed or the quality gate blocked delivery
+        if visible["error"]:
             response_body.update({
-                "error": parsed_output.get('error') if parsed_output else 'Unknown error',
-                "error_info": parsed_output
+                "error": visible["error"],
+                "error_info": parsed_output if parsed_output is not None else {
+                    "error": sf_error,
+                    "cause": sf_cause,
+                },
             })
 
         # Add execution history if requested

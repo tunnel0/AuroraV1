@@ -12,14 +12,23 @@ Features:
 
 import os
 import json
+import random
+import time
 import yaml
 import re
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
+from bedrock_fallback import fallback_model_ids, run_model_chain
+from optional_fields import leer_campos_opcionales
+from template_tokens import sanear_plan_maestro
+
+from format_budget import aplicar_presupuesto_de_formato, escalar_plan_existente, sin_ajuste
 from manual_context import select_manual_context, flatten_to_text
+from audience_adaptation import planner_audience_block, resolve_audience_profile
 from referent_check import (
     auditar_contrato,
     auditar_duraciones_curso,
@@ -480,33 +489,95 @@ def extract_all_labs(
     return labs
 
 
-def call_bedrock_agent(prompt: str, model_id: str) -> str:
-    """Call AWS Bedrock with Strands Agents pattern."""
-    try:
-        payload = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 32000,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "temperature": 0.7
-        }
-        
-        response = bedrock_client.invoke_model(
-            modelId=model_id,
-            body=json.dumps(payload),
-            contentType='application/json',
-            accept='application/json'
+_PLANNER_BEDROCK_ATTEMPTS = max(1, int(os.getenv("BEDROCK_APP_MAX_ATTEMPTS", "5")))
+_modelo_que_respondio: dict = {"id": None}
+
+
+def _planner_error_es_transitorio(exc: Exception) -> bool:
+    if isinstance(exc, ClientError):
+        code = (exc.response.get("Error") or {}).get("Code", "") or ""
+        return code in (
+            "ThrottlingException",
+            "TooManyRequestsException",
+            "ServiceUnavailableException",
+            "ModelTimeoutException",
+            "InternalServerException",
         )
-        
-        response_body = json.loads(response['body'].read())
-        return response_body['content'][0]['text']
-    
-    except Exception as e:
-        print(f"❌ Bedrock API error: {e}")
+    mensaje = str(exc)
+    return any(
+        token in mensaje
+        for token in (
+            "ThrottlingException",
+            "TooManyRequestsException",
+            "ServiceUnavailableException",
+            "ModelTimeoutException",
+            "InternalServerException",
+        )
+    )
+
+
+def _planner_backoff(attempt_index: int) -> None:
+    delay = min(90.0, 3.0 * (2 ** attempt_index))
+    time.sleep(delay + random.uniform(0, min(8.0, delay * 0.25)))
+
+
+def _invoke_bedrock_planner(prompt: str, model_id: str) -> str:
+    payload = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 32000,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+    }
+    response = bedrock_client.invoke_model(
+        modelId=model_id,
+        body=json.dumps(payload),
+        contentType="application/json",
+        accept="application/json",
+    )
+    response_body = json.loads(response["body"].read())
+    return response_body["content"][0]["text"]
+
+
+def _respaldo_openai_o_gemini_planner(prompt: str) -> Optional[str]:
+    try:
+        secret_data = get_secret("aurora/openai-api-key")
+        api_key = (secret_data or {}).get("api_key") or os.environ.get("OPENAI_API_KEY")
+        if api_key:
+            text = call_openai_agent(prompt, api_key, DEFAULT_OPENAI_MODEL)
+            _modelo_que_respondio["id"] = DEFAULT_OPENAI_MODEL
+            return text
+    except Exception as exc:
+        print(f"⚠️ OpenAI fallback unavailable: {exc}")
+    try:
+        google_key = get_google_api_key()
+        if google_key:
+            text = call_gemini_agent(prompt, google_key)
+            _modelo_que_respondio["id"] = "gemini"
+            return text
+    except Exception as exc:
+        print(f"⚠️ Gemini fallback unavailable: {exc}")
+    return None
+
+
+def call_bedrock_agent(prompt: str, model_id: str) -> str:
+    """Bedrock with per-minute backoff, then BEDROCK_FALLBACK_MODELS, then OpenAI/Gemini."""
+    try:
+        text, used = run_model_chain(
+            lambda mid: _invoke_bedrock_planner(prompt, mid),
+            fallback_model_ids(model_id),
+            max_attempts=_PLANNER_BEDROCK_ATTEMPTS,
+            sleep=_planner_backoff,
+            is_transient=_planner_error_es_transitorio,
+        )
+        _modelo_que_respondio["id"] = used
+        if used != model_id:
+            print(f"🔄 Planner answered with fallback model {used}")
+        return text
+    except Exception as bedrock_err:
+        print(f"❌ Planner Bedrock chain failed: {bedrock_err}")
+        alterno = _respaldo_openai_o_gemini_planner(prompt)
+        if alterno:
+            return alterno
         raise
 
 
@@ -703,6 +774,7 @@ def generate_lab_master_plan(
     course_description = course_info.get('description', '')
     course_level = course_info.get('level', 'intermediate')
     prerequisites = course_info.get('prerequisites', [])
+    audience_profile = resolve_audience_profile(course_info)
     
     # For large courses, process labs in batches to avoid token limits and timeouts
     num_batches = (len(labs) + batch_size - 1) // batch_size
@@ -783,23 +855,36 @@ def generate_lab_master_plan(
             # Multiple batches - streamlined prompt
             prompt_prefix = f"Create a detailed plan for this batch of labs (batch {batch_idx + 1} of {num_batches})."
         
+        golden_block = ""
+        if os.environ.get("PLANNER_GOLDEN_LAB", "1") != "0":
+            try:
+                from golden_lab_example import build_planner_golden_section
+
+                golden_block = build_planner_golden_section(course_info)
+            except Exception as exc:
+                print(f"Planner golden example skipped: {exc}")
+                golden_block = ""
+
         prompt = f"""
 You are an expert technical instructor designing laboratory guides.
 
 COURSE: {course_title}
 Level: {course_level}
 {'Prerequisites: ' + ', '.join(prerequisites) if prerequisites else ''}
+{planner_audience_block(audience_profile, course_info)}
 
 LABS IN THIS BATCH ({len(batch_labs)} labs):
 {chr(10).join(labs_summary)}
 
 REQUIREMENTS: {additional_requirements if additional_requirements else 'None specified'}
 {manual_block}{correction_block}
+{golden_block}
 THOR ALIGNMENT & DEEP TECH SPEC:
 - Software Version Locking: Lock ALL software requirements to exact, explicit version numbers (e.g., PostgreSQL 16.2, Python 3.12.1, Docker 26.0.0). No vague versions like "latest" or "1.x".
 - Licensing & Official Sources: For every software requirement provide the official source URL and the license type. If a value is not confirmed, use [ENLACE OFICIAL] / [LICENCIA POR VALIDAR]. Never invent versions, licenses, capabilities or availability; verify against official documentation.
 - Tool Separation: For courses about Copilot/assistants, distinguish Microsoft 365 Copilot, Copilot Chat, Designer, Planner and similar tools, each with its own license and configuration.
 - Environmental Constants: Explicitly predefine global environment defaults in special_considerations (e.g., default database name, container names, default ports, working directories).
+- Setup Guide capabilities: Express requirements as licenses, service accounts, permissions and access — not OS, IDE, shell, local paths or folder trees unless REQUIREMENTS or the syllabus explicitly names them. Use [LICENCIA POR VALIDAR] / [ENLACE OFICIAL] when unconfirmed.
 - Outline Contract (A5): when a lab carries a DECLARED OBJECTIVE or DECLARED DESCRIPTION, they are the instructor's approved contract. `objectives[0]` MUST be the DECLARED OBJECTIVE copied exactly as written — do not reword, summarise, translate or split it; you may add further objectives after it. `scope` must build on the DECLARED DESCRIPTION and must not contradict it. When the outline declares nothing, derive objectives and scope from the title and topics.
 - Continuity: Ensure each lab's scope builds logically on the outputs and state created by the previous lab.
 - Demos & Demostraciones: For any lab designated as a Demo or containing 'Demo' in its title, this activity is an INSTRUCTOR-LED DEMONSTRATION (performed live by the instructor while students observe and take notes, NOT an individual student lab). The lab_title MUST contain the word 'Demo' and its scope/objectives must explicitly specify that it is demonstrated by the instructor.
@@ -1102,6 +1187,173 @@ def auditar_y_corregir_plan(master_plan: dict, fuentes: str, regenerar, max_inte
     return master_plan, informe
 
 
+def _ficha_de_hallazgo(violacion: dict, verificacion: str = "A1") -> dict:
+    return {
+        "verificacion": violacion.get("verificacion") or verificacion,
+        "confianza": violacion.get("confianza") or "baja",
+        "valor": str(violacion.get("valor") or "")[:300],
+        "lab_id": violacion.get("lab_id"),
+        "campo": violacion.get("campo"),
+    }
+
+
+def _minutos_plan_por_modulo(planes) -> dict:
+    """Minutes the saved plan assigns to each module prefix (``01``, ``02``)."""
+    salida: dict = {}
+    for plan in planes or []:
+        if not isinstance(plan, dict):
+            continue
+        prefijo = str(plan.get("lab_id") or "")[:2]
+        if len(prefijo) != 2 or not prefijo.isdigit():
+            continue
+        bruto = plan.get("estimated_duration")
+        if bruto in (None, ""):
+            bruto = plan.get("duration_minutes") or 0
+        try:
+            minutos = int(bruto or 0)
+        except (TypeError, ValueError):
+            minutos = 0
+        if minutos < 0:
+            minutos = 0
+        salida[prefijo] = salida.get(prefijo, 0) + minutos
+    return salida
+
+
+def clasificar_hallazgos_de_plan(
+    referential_report: dict,
+    duraciones_curso: dict,
+    contrato_informe: dict,
+    preflight: dict | None = None,
+    ajuste_formato: dict | None = None,
+) -> dict:
+    """Plan-level gate after the last A1 retry and the A2/A3/A5 copies.
+
+    High confidence blocks: undeclared files (A1), a syllabus quantity or
+    duration mismatch that reconciliation did not clear (A2/A3), and an
+    objective or other contract field that still disagrees (A5). Low-confidence
+    referents and pre-flight signals stay warnings.
+
+    A shorter lab count is not a mismatch when the format budget merged or
+    dropped practices on purpose, or when a selective update kept a plan that
+    already records that merge. A total that still exceeds the course stays blocking.
+    """
+    bloquean: List[dict] = []
+    advertencias: List[dict] = []
+    for violacion in (referential_report or {}).get("violaciones") or ():
+        if not isinstance(violacion, dict):
+            continue
+        ficha = _ficha_de_hallazgo(violacion)
+        if ficha["confianza"] == "alta":
+            bloquean.append(ficha)
+        else:
+            advertencias.append(ficha)
+
+    if duraciones_curso and not duraciones_curso.get("ok", True):
+        ajuste = ajuste_formato or {}
+        conteo_del_formato = (
+            not duraciones_curso.get("excede_total")
+            and not duraciones_curso.get("sobran")
+            and (
+                bool(ajuste.get("ajustado"))
+                or bool(ajuste.get("conteo_preservado"))
+            )
+        )
+        detalle_conteo = (
+            f"cantidad/duracion: plan {duraciones_curso.get('suma_plan')} min "
+            f"frente a curso {duraciones_curso.get('total_curso')}; "
+            f"{duraciones_curso.get('labs_plan')} laboratorio(s) frente a "
+            f"{duraciones_curso.get('labs_temario')} practica(s) del temario "
+            f"(faltan {duraciones_curso.get('faltan')}, sobran {duraciones_curso.get('sobran')})"
+        )
+        if conteo_del_formato:
+            advertencias.append({
+                "verificacion": "A3",
+                "confianza": "baja",
+                "valor": (
+                    "el presupuesto de formato reunió prácticas del temario; "
+                    + detalle_conteo
+                )[:300],
+                "lab_id": None,
+                "campo": "format_budget",
+            })
+        else:
+            bloquean.append({
+                "verificacion": "A3",
+                "confianza": "alta",
+                "valor": detalle_conteo,
+                "lab_id": None,
+                "campo": "duration",
+            })
+
+    for conflicto in (contrato_informe or {}).get("conflictos") or ():
+        if not isinstance(conflicto, dict):
+            continue
+        bloquean.append({
+            "verificacion": "A5",
+            "confianza": "alta",
+            "valor": (
+                f"{conflicto.get('campo')}: temario «{conflicto.get('temario')}» "
+                f"vs plan «{conflicto.get('plan')}»"
+            )[:300],
+            "lab_id": conflicto.get("lab_id"),
+            "campo": conflicto.get("campo"),
+        })
+
+    for modulo in (preflight or {}).get("modulos") or ():
+        senales = modulo.get("senales") or []
+        if not senales:
+            continue
+        advertencias.append({
+            "verificacion": "preflight",
+            "confianza": "baja",
+            "valor": (
+                f"modulo {modulo.get('modulo')}: {', '.join(senales)} "
+                f"({modulo.get('por_laboratorio')} min/lab)"
+            )[:300],
+            "lab_id": None,
+            "campo": "preflight",
+        })
+
+    if bloquean:
+        partes = [
+            f"{h.get('verificacion')}: {h.get('valor')}"
+            for h in bloquean[:12]
+        ]
+        resumen = ("NEEDS_REVIEW " + "; ".join(partes))[:1800]
+        estado = "needs_review"
+    else:
+        resumen = "passed"
+        estado = "passed"
+    return {
+        "quality_status": estado,
+        "quality_summary": resumen,
+        "quality_findings": bloquean,
+        "quality_warnings": advertencias,
+    }
+
+
+def _registrar_puerta_de_plan(puerta: dict) -> None:
+    estado = puerta.get("quality_status")
+    hallazgos = puerta.get("quality_findings") or []
+    advertencias = puerta.get("quality_warnings") or []
+    if estado == "needs_review":
+        print(
+            f"\n🚫 QUALITY GATE: plan needs_review. {len(hallazgos)} high-confidence "
+            f"finding(s) remain after retry/reconciliation and the course will not "
+            f"be delivered as passed."
+        )
+        for hallazgo in hallazgos[:12]:
+            print(f"     🚫 {hallazgo.get('verificacion')} {hallazgo.get('valor')}")
+        return
+    if advertencias:
+        print(
+            f"\n⚠️  QUALITY GATE: plan passed with {len(advertencias)} "
+            f"low-confidence warning(s); generation continues."
+        )
+        return
+    print("\n✅ QUALITY GATE: plan passed")
+
+
 def lambda_handler(event, context):
     """
     Lambda handler for Lab Planner (Agent 1).
@@ -1132,13 +1384,16 @@ def lambda_handler(event, context):
     print("="*70)
     
     try:
-        # Extract parameters
+        # Extract parameters. The state machine passes the whole state, so extra
+        # keys are ignored and optional start fields are read with .get.
         course_bucket = event.get('course_bucket', 'crewai-course-artifacts')
         outline_key = event['outline_s3_key']
         project_folder = event['project_folder']
         model_provider = event.get('model_provider', 'bedrock')
-        lab_requirements = event.get('lab_requirements')
-        manual_text_s3_key = event.get('manual_text_s3_key')
+        opcionales = leer_campos_opcionales(event)
+        lab_requirements = opcionales['lab_requirements']
+        manual_text_s3_key = opcionales['manual_text_s3_key']
+        manual_s3_keys = opcionales['manual_s3_keys']
 
         # Support bedrock, openai, and google/gemini providers
         original_provider = event.get('model_provider', 'bedrock').lower()
@@ -1160,7 +1415,7 @@ def lambda_handler(event, context):
             modules_to_generate = [int(modules_to_generate)]
         
         # NEW: Get lab IDs to regenerate (takes priority over module filtering)
-        lab_ids_to_regenerate = event.get('lab_ids_to_regenerate')
+        lab_ids_to_regenerate = opcionales['lab_ids_to_regenerate']
         
         print(f"📦 Bucket: {course_bucket}")
         print(f"📄 Outline: {outline_key}")
@@ -1170,6 +1425,7 @@ def lambda_handler(event, context):
         if lab_ids_to_regenerate:
             print(f"🆔 Lab IDs to Regenerate: {lab_ids_to_regenerate}")
         print(f"📋 Additional Requirements: {lab_requirements if lab_requirements else 'None'}")
+        print(f"📎 manual_s3_keys: {manual_s3_keys if manual_s3_keys else 'None'}")
         
         # Step 1: Load outline
         outline_data = load_outline_from_s3(course_bucket, outline_key)
@@ -1194,7 +1450,11 @@ def lambda_handler(event, context):
                 'project_folder': project_folder,
                 'bucket': course_bucket,
                 'model_provider': model_provider,
-                'message': 'No lab activities found in outline - skipping lab generation'
+                'message': 'No lab activities found in outline - skipping lab generation',
+                'quality_status': 'passed',
+                'quality_summary': 'passed',
+                'quality_findings': [],
+                'quality_warnings': [],
             }
         
         # Step 2b: Selección del manual de referencia (paso 0 de calidad).
@@ -1257,9 +1517,11 @@ def lambda_handler(event, context):
 
         outline_fallback = master_plan.pop('_outline_fallback_used', False)
 
+        plan_previo = None
         if lab_ids_to_regenerate:
             regen_set = {x for x in lab_ids_to_regenerate if x}
             existing = load_master_plan_from_s3(course_bucket, project_folder)
+            plan_previo = existing
             if not existing or not existing.get("lab_plans"):
                 raise ValueError(
                     "lab_ids_to_regenerate requires existing "
@@ -1306,16 +1568,6 @@ def lambda_handler(event, context):
             plan_lab["presupuesto_duracion"] = presupuesto_de_duracion(
                 plan_lab.get("estimated_duration") or plan_lab.get("duration_minutes")
             )
-        duraciones_curso = auditar_duraciones_curso(
-            master_plan, labs, course_info.get("total_duration_minutes")
-        )
-        if not duraciones_curso["ok"]:
-            print(
-                f"⏱️  A3: plan de {duraciones_curso['suma_plan']} min sobre un curso de "
-                f"{duraciones_curso['total_curso']} min; "
-                f"{duraciones_curso['labs_plan']} laboratorio(s) frente a "
-                f"{duraciones_curso['labs_temario']} práctica(s) del temario"
-            )
 
         # A5: el temario como contrato. Lo que el temario declara del laboratorio
         # (objetivo y descripción) se copia al plan; la IA solo complementa. Va después
@@ -1334,14 +1586,84 @@ def lambda_handler(event, context):
                 f"temario en {contrato_informe['labs']} laboratorio(s)"
             )
 
-        # Pre-flight de duración: el temario no puede sostener más práctica de la que
-        # declara. Se calcula sobre el plan final (tras A3 y A5) y se guarda en los
-        # metadatos. Es un aviso para quien revisa el temario: no bloquea la generación.
-        preflight = preflight_duracion(course_info, master_plan.get("lab_plans") or [])
-        if preflight["avisos"]:
+        # Format budget gate. Pre-flight used to print and continue; practices that
+        # do not fit the syllabus profile are merged or dropped before the writer runs.
+        # A selective update keeps the labs the caller asked to regenerate.
+        if lab_ids_to_regenerate:
+            if os.environ.get("FORMAT_RECAP_SELECTIVE", "1") == "0":
+                ajuste_formato = sin_ajuste(
+                    course_info, master_plan, motivo="actualizacion_selectiva"
+                )
+            else:
+                ajuste_formato = escalar_plan_existente(course_info, master_plan)
+            preflight = preflight_duracion(
+                course_info,
+                master_plan.get("lab_plans") or [],
+                minutos_plan=_minutos_plan_por_modulo(master_plan.get("lab_plans")),
+            )
+        else:
+            preflight_previo = preflight_duracion(
+                course_info, master_plan.get("lab_plans") or []
+            )
+            ajuste_formato = aplicar_presupuesto_de_formato(course_info, master_plan)
+            preflight = preflight_duracion(
+                course_info,
+                master_plan.get("lab_plans") or [],
+                minutos_plan=_minutos_plan_por_modulo(master_plan.get("lab_plans")),
+            )
+            if ajuste_formato.get("ajustado"):
+                preflight["antes"] = {
+                    "avisos": preflight_previo.get("avisos"),
+                    "modulos": preflight_previo.get("modulos"),
+                }
+                print(
+                    f"⏱️  Formato {ajuste_formato.get('perfil')}: "
+                    f"{ajuste_formato.get('labs_antes')} práctica(s) / "
+                    f"{ajuste_formato.get('suma_antes')} min → "
+                    f"{ajuste_formato.get('labs_despues')} / "
+                    f"{ajuste_formato.get('suma_despues')} min"
+                )
+        preflight["gate"] = {
+            "aplicado": bool(ajuste_formato.get("ajustado")),
+            "perfil": ajuste_formato.get("perfil"),
+            "excede": bool(ajuste_formato.get("excede")),
+        }
+        if ajuste_formato.get("excede"):
+            # The format cap never fails the course. The plan ships and the
+            # overrun is a warning on the quality report.
+            aviso = (
+                "format budget could not fit the plan inside the syllabus "
+                f"({ajuste_formato.get('suma_despues')} min, "
+                f"ceiling {ajuste_formato.get('techo_curso')})"
+            )
+            print(f"⚠️  {aviso}")
+            ajuste_formato["quality_warning"] = aviso
+            preflight.setdefault("avisos", 0)
+            if isinstance(preflight.get("avisos"), int):
+                preflight["avisos"] = preflight["avisos"] + 1
+        if preflight["avisos"] and not ajuste_formato.get("ajustado"):
             print(
                 f"⏱️  Pre-flight: {preflight['avisos']} aviso(s) de duración en "
                 f"{preflight['modulos_con_aviso']} módulo(s) del temario"
+            )
+
+        # Selective regeneration plans only the requested labs, then merges them
+        # into the saved plan. The count audit has to see the whole syllabus,
+        # not that subset, or every partial update looks like extra labs.
+        labs_para_conteo = labs
+        if lab_ids_to_regenerate:
+            labs_para_conteo = extract_all_labs(
+                outline_data, modules_to_generate="all"
+            )
+        duraciones_curso = auditar_duraciones_curso(
+            master_plan, labs_para_conteo, course_info.get("total_duration_minutes")
+        )
+        if not duraciones_curso["ok"]:
+            print(
+                f"⏱️  A3: plan de {duraciones_curso['suma_plan']} min sobre un curso de "
+                f"{duraciones_curso['total_curso']} min; "
+                f"{duraciones_curso['labs_plan']} laboratorio(s) frente a "
+                f"{duraciones_curso['labs_temario']} práctica(s) del temario"
             )
 
         # Reauditoría sobre el plan final (tras el merge parcial, si lo hubo): es el
@@ -1365,6 +1687,7 @@ def lambda_handler(event, context):
             'model_provider': model_provider,
             'course_title': course_info.get('title', 'Unknown'),
             'course_language': course_language,  # Pass language to LabWriter
+            'audience_profile': resolve_audience_profile(course_info),
             'total_labs': len(lab_plan_list),
             'total_duration_minutes': duration_sum,
             'additional_requirements': lab_requirements,
@@ -1389,10 +1712,30 @@ def lambda_handler(event, context):
                 'corregidos': cantidades['corregidos'],
             },
             'preflight_duracion': preflight,
+            'format_budget': ajuste_formato,
             # C2: el entorno que la petición declara, extraído de forma
             # determinista. Es la misma lista que auditará el Writer.
             'entorno_declarado': entorno_de_peticion(lab_requirements),
         }
+
+        ajuste_para_puerta = dict(ajuste_formato or {})
+        if lab_ids_to_regenerate and not ajuste_para_puerta.get("ajustado"):
+            presupuesto_previo = ((plan_previo or {}).get("metadata") or {}).get("format_budget") or {}
+            ya_reunido = bool(presupuesto_previo.get("ajustado")) or any(
+                isinstance(plan, dict) and plan.get("syllabus_items_combined")
+                for plan in (master_plan.get("lab_plans") or ())
+            )
+            if ya_reunido:
+                ajuste_para_puerta["conteo_preservado"] = True
+        puerta = clasificar_hallazgos_de_plan(
+            referential_report,
+            duraciones_curso,
+            contrato_informe,
+            preflight,
+            ajuste_formato=ajuste_para_puerta,
+        )
+        master_plan['metadata']['quality_gate'] = puerta
+        _registrar_puerta_de_plan(puerta)
 
         guardar_informe_referencial(course_bucket, project_folder, referential_report)
         guardar_informe_referencial(
@@ -1408,6 +1751,35 @@ def lambda_handler(event, context):
             nombre="contract-integrity.json",
         )
         
+        # Template tokens are filled from the course, then neutralized. The plan
+        # is saved either way; a leftover is a warning, not a failure.
+        hallazgo_tokens = None
+        try:
+            master_plan, hallazgo_tokens = sanear_plan_maestro(master_plan, course_info)
+        except Exception as token_exc:
+            print(f"⚠️  No se pudo sanear el plan de laboratorios: {token_exc}")
+
+        try:
+            from golden_lab_example import reparar_copia_del_ejemplo
+
+            master_plan, copiados = reparar_copia_del_ejemplo(master_plan, course_info)
+            if copiados:
+                puerta.setdefault("quality_warnings", []).append({
+                    "verificacion": "golden_copy",
+                    "confianza": "baja",
+                    "valor": (
+                        "El plan reutilizaba nombres del ejemplo: "
+                        + ", ".join(copiados)
+                        + ". / The plan reused example names: "
+                        + ", ".join(copiados)
+                        + "."
+                    )[:300],
+                    "lab_id": None,
+                    "campo": "golden_example",
+                })
+        except Exception as copia_exc:
+            print(f"⚠️  No se pudo revisar la copia del ejemplo: {copia_exc}")
+
         # Step 4: Save to S3
         master_plan_key = save_master_plan_to_s3(
             bucket=course_bucket,
@@ -1416,10 +1788,17 @@ def lambda_handler(event, context):
         )
         
         print(f"\n{'='*70}")
-        print(f"✅ LAB PLANNING COMPLETED SUCCESSFULLY")
+        if puerta["quality_status"] == "needs_review":
+            print(
+                "🚫 LAB PLANNING NEEDS REVIEW: high-confidence syllabus findings "
+                "remain. The plan is saved and the course continues."
+            )
+        else:
+            print(f"✅ LAB PLANNING COMPLETED SUCCESSFULLY")
+        print(f"   quality_status: {puerta['quality_status']}")
         print(f"{'='*70}\n")
         
-        return {
+        respuesta = {
             'statusCode': 200,
             'master_plan_key': master_plan_key,
             'total_labs': len(lab_plan_list),
@@ -1428,7 +1807,14 @@ def lambda_handler(event, context):
             'bucket': course_bucket,
             'model_provider': model_provider,
             'lab_plans_source': master_plan['metadata'].get('lab_plans_source', 'ai'),
+            'quality_status': puerta['quality_status'],
+            'quality_summary': puerta['quality_summary'],
+            'quality_findings': puerta['quality_findings'],
+            'quality_warnings': puerta['quality_warnings'],
         }
+        if hallazgo_tokens:
+            respuesta['quality_issue'] = hallazgo_tokens
+        return respuesta
     
     except KeyError as e:
         print(f"❌ Missing required parameter: {e}")
